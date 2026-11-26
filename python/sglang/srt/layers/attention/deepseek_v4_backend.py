@@ -204,6 +204,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hcu,
     is_xpu,
+    print_warning_once,
 )
 from sglang.srt.utils.common import is_sm120_supported
 
@@ -285,6 +286,60 @@ def _has_native_hcu_rope_fake_quant() -> bool:
     except (ImportError, OSError):
         return False
     return callable(rope_fp4_fake_quant)
+
+
+@functools.lru_cache(maxsize=1)
+def _hcu_compact_gather_available() -> bool:
+    try:
+        from lightop.kvcache import dsv4_gather_upconvert_compact_k_cache_paged
+    except (ImportError, OSError):
+        return False
+    return callable(dsv4_gather_upconvert_compact_k_cache_paged)
+
+
+def _hcu_flashmla_supports_bf16_extra_kv(device: torch.device) -> bool:
+    if (
+        not _is_hcu
+        or device.type != "cuda"
+        or not torch.cuda.is_available()
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return True
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _probe_hcu_flashmla_bf16_extra_kv(index)
+
+
+@functools.lru_cache(maxsize=None)
+def _probe_hcu_flashmla_bf16_extra_kv(device_index: int) -> bool:
+    # Cache only the device probe. A skipped probe during capture is inconclusive.
+    try:
+        import flash_mla
+
+        with torch.cuda.device(device_index), torch.no_grad():
+            q = torch.zeros((1, 1, 128, 512), dtype=torch.bfloat16, device=device_index)
+            k_cache = q.new_zeros((1, 16, 1, 512))
+            indices = q.new_zeros((1, 1, PAGE_INDEX_ALIGNED_SIZE), dtype=torch.int32)
+            lengths = indices.new_full((1,), 16)
+            flash_mla.flash_mla_with_kvcache(
+                q,
+                k_cache,
+                None,
+                None,
+                512,
+                flash_mla.get_mla_metadata()[0],
+                is_fp8_kvcache=False,
+                indices=indices,
+                topk_length=lengths,
+                extra_k_cache=torch.zeros_like(k_cache),
+                extra_indices_in_kvcache=indices,
+                extra_topk_length=lengths,
+            )
+    except Exception as exc:
+        if isinstance(exc, RuntimeError) and "extra_kv" in str(exc).lower():
+            return False
+        # An inconclusive probe preserves the wheel's existing dispatch.
+        logger.debug("FlashMLA BF16 extra_kv probe on cuda:%d: %s", device_index, exc)
+    return True
 
 
 def _dsv4_bf16_gather_model_family(quant_config) -> str:
@@ -1897,6 +1952,9 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
+        self._init_dsv4_bf16_flashmla(model_runner.model_config.hf_quant_config)
+
+    def _init_dsv4_bf16_flashmla(self, quant_config) -> None:
         flashmla_explicit = envs.SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA.is_set()
         lightop_explicit = envs.SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER.is_set()
         self._dsv4_bf16_flashmla_decode = envs.SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA.get()
@@ -1910,6 +1968,7 @@ class DeepseekV4AttnBackend(
         )
         if not lightop_explicit and not self._dsv4_bf16_flashmla_decode:
             self._dsv4_lightop_bf16_gather = False
+        self._dsv4_bf16_dual_supported = True
         self._dsv4_lightop_kvcache_op = None
         # Persistent W4A8 compact-gather workspaces; FP8 allocates per call.
         self._dsv4_bf16_flashmla_workspaces: Dict[
@@ -1976,6 +2035,29 @@ class DeepseekV4AttnBackend(
                     )
                     self._dsv4_lightop_bf16_gather = False
                     self._dsv4_bf16_gather_dedup = False
+            if (
+                self._dsv4_lightop_bf16_gather
+                and not _hcu_flashmla_supports_bf16_extra_kv(self.device)
+            ):
+                # Even a wheel with compact gather can fall through to dual
+                # gather for some page sizes (e.g. a 16-token C128 page).
+                if flashmla_explicit and not lightop_explicit:
+                    self._dsv4_lightop_bf16_gather = False
+                    self._dsv4_bf16_gather_dedup = False
+                    print_warning_once(
+                        "This flash_mla build lacks BF16 extra_kv support. "
+                        "Using Triton combined gather to honor "
+                        "SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA=1."
+                    )
+                else:
+                    self._dsv4_bf16_dual_supported = False
+                    print_warning_once(
+                        "This flash_mla build lacks BF16 extra_kv support. "
+                        "Using LightOp BF16 FlashMLA for SWA-only layers and "
+                        "FP8 FlashMLA for dual-cache layers. Set "
+                        "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER=0 to use "
+                        "Triton combined gather for BF16 on all decode layers."
+                    )
             if self._dsv4_lightop_bf16_gather:
                 try:
                     from lightop import op as lightop_kvcache
@@ -2020,9 +2102,7 @@ class DeepseekV4AttnBackend(
             )
 
         # Keep model selection separate from optional FP8 gather extensions.
-        self._dsv4_bf16_gather_family = _dsv4_bf16_gather_model_family(
-            model_runner.model_config.hf_quant_config
-        )
+        self._dsv4_bf16_gather_family = _dsv4_bf16_gather_model_family(quant_config)
         self._dsv4_compact_gather_enabled = self._dsv4_bf16_gather_family == "w4a8"
         self._dsv4_query_reuse_zero_lengths = (
             torch.zeros(64, dtype=torch.int32, device=self.device)
@@ -4087,7 +4167,11 @@ class DeepseekV4AttnBackend(
             self._allocate_dsv4_bf16_flashmla_workspace(
                 "swa", max_num_tokens, ceil_align(SWA_WINDOW, PAGE_INDEX_ALIGNED_SIZE)
             )
-        if self._dsv4_compact_gather_enabled and self._dsv4_bf16_flashmla_decode:
+        if (
+            self._dsv4_compact_gather_enabled
+            and self._dsv4_bf16_flashmla_decode
+            and getattr(self, "_dsv4_bf16_dual_supported", True)
+        ):
             self._allocate_dsv4_bf16_flashmla_workspace(
                 "combined",
                 max_num_tokens,
@@ -6501,7 +6585,7 @@ class DeepseekV4AttnBackend(
         self,
         *,
         input_dict: Dict[str, object],
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         layer_id: int,
     ) -> torch.Tensor:
         backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
@@ -6617,13 +6701,7 @@ class DeepseekV4AttnBackend(
         num_queries, _, swa_topk = swa_indices.shape
         extra_topk = 0 if extra_indices is None else extra_indices.shape[-1]
 
-        if self._dsv4_lightop_bf16_gather:
-            try:
-                from lightop.kvcache import (
-                    dsv4_gather_upconvert_compact_k_cache_paged as compact_gather,
-                )
-            except ImportError:
-                return None
+        if self._dsv4_lightop_bf16_gather and _hcu_compact_gather_available():
             common = (
                 swa_k_cache.is_cuda
                 and swa_k_cache.shape[1] == 256
@@ -6658,7 +6736,11 @@ class DeepseekV4AttnBackend(
                 and extra_indices.dtype == torch.int32
                 and extra_topk_lengths.dtype == torch.int32
             )
-            if compact_gather is not None and (draft or dual):
+            if draft or dual:
+                from lightop.kvcache import (
+                    dsv4_gather_upconvert_compact_k_cache_paged as compact_gather,
+                )
+
                 swa_ids = swa_indices[:, 0, :].contiguous()
                 swa_lens = swa_topk_lengths.reshape(-1).contiguous()
                 group = 1
@@ -7053,7 +7135,7 @@ class DeepseekV4AttnBackend(
         extra_k_cache: Optional[torch.Tensor],
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         layer_id: int,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
@@ -7068,10 +7150,19 @@ class DeepseekV4AttnBackend(
         # The unified HCU MLA path also sends ordinary prefill here. Restrict
         # BF16 gather to decode-family forwards so prefill keeps the original
         # KV input and attention path. IDLE must not allocate gather workspaces.
-        use_bf16_gather = self._dsv4_bf16_flashmla_decode and (
-            logical_forward_mode.is_decode()
-            or logical_forward_mode.is_target_verify()
-            or logical_forward_mode.is_draft_extend_v2()
+        # Compressed layers supply their extra pool even for zero extra tokens,
+        # so this decision keeps the KV dtype stable for each ratio's sched_meta.
+        use_bf16_gather = (
+            self._dsv4_bf16_flashmla_decode
+            and (
+                extra_k_cache is None
+                or getattr(self, "_dsv4_bf16_dual_supported", True)
+            )
+            and (
+                logical_forward_mode.is_decode()
+                or logical_forward_mode.is_target_verify()
+                or logical_forward_mode.is_draft_extend_v2()
+            )
         )
         if use_bf16_gather and swa_k_cache.dtype != torch.bfloat16:
             (
@@ -7132,7 +7223,7 @@ class DeepseekV4AttnBackend(
         extra_indices: Optional[torch.Tensor],
         extra_topk_lengths: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
-        compress_ratio: Literal[0, 4, 128],
+        compress_ratio: Literal[0, 1, 2, 4, 128],
         layer_id: int,
     ) -> torch.Tensor:
         # On the current Hygon FlashMLA package, flash_mla_with_kvcache is backed

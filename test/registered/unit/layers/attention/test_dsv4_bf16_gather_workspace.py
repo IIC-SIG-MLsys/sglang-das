@@ -1,70 +1,95 @@
 """CPU regressions for capture-safe BF16 gather workspace views."""
 
+from __future__ import annotations
+
 import ast
+import functools
+import logging
+import os
 import sys
 import unittest
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Literal, Optional, Tuple
 from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.utils import ceil_align
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def workspace_methods():
+SOURCE = (
+    Path(__file__).resolve().parents[5]
+    / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def backend_functions():
     # Isolate the actual methods from hardware-dependent backend imports.
-    root = Path(__file__).resolve().parents[5]
-    source = root / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"))
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     cls = next(
         n
         for n in tree.body
         if isinstance(n, ast.ClassDef) and n.name == "DeepseekV4AttnBackend"
     )
-    names = {
+    return {
+        node.name: node
+        for node in (*tree.body, *cls.body)
+        if isinstance(node, ast.FunctionDef)
+    }
+
+
+def load_functions(names, **namespace):
+    nodes = [backend_functions()[name] for name in names]
+    scope = {
+        "torch": torch,
+        "functools": functools,
+        "logger": logging.getLogger(__name__),
+        **namespace,
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), "exec"), scope)
+    return scope
+
+
+def workspace_methods(**namespace):
+    methods = (
         "_allocate_dsv4_bf16_flashmla_workspace",
         "_get_dsv4_bf16_flashmla_workspace",
         "_prepare_dsv4_bf16_flashmla_inputs",
         "_try_prepare_dsv4_w4a8_bf16_inputs",
-    }
-    methods = [
-        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in names
-    ]
-    scope = {
-        "torch": torch,
-        "Tuple": Tuple,
-        "Optional": Optional,
-        "ForwardMode": object,
-    }
-    exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), "exec"), scope)
+        "_get_dsv4_bf16_gather_dedup_state",
+        "_use_dsv4_bf16_gather_dedup",
+        "_init_dsv4_bf16_flashmla",
+        "init_cuda_graph_state",
+        "_forward_flash_mla_decode",
+        "_build_flash_mla_input_dict",
+        "_call_flash_mla_with_kvcache",
+    )
+    scope = load_functions(
+        (*methods, "_hcu_compact_gather_available", "_dsv4_bf16_gather_model_family"),
+        **namespace,
+    )
     obj = SimpleNamespace(
-        device="cpu",
+        device=torch.device("cpu"),
         _dsv4_bf16_flashmla_decode=True,
         _dsv4_compact_gather_enabled=True,
         _dsv4_bf16_flashmla_workspaces={},
     )
-    for name in names:
+    for name in methods:
         setattr(obj, name, scope[name].__get__(obj))
     return obj
 
 
 def model_family(config):
-    root = Path(__file__).resolve().parents[5]
-    source = root / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    node = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "_dsv4_bf16_gather_model_family"
-    )
-    scope = {}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), scope)
-    return scope[node.name](config)
+    name = "_dsv4_bf16_gather_model_family"
+    return load_functions([name])[name](config)
 
 
 def w4a8_config():
@@ -107,32 +132,229 @@ class CudaLikeTensor(torch.Tensor):
         return True
 
 
-class TestBF16GatherModelDispatch(unittest.TestCase):
-    def test_forward_caller_keeps_fallback_lazy_and_original_kwargs(self):
-        root = Path(__file__).resolve().parents[5]
-        source = root / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
-        cls = next(
-            n
-            for n in ast.parse(source.read_text()).body
-            if isinstance(n, ast.ClassDef) and n.name == "DeepseekV4AttnBackend"
+@contextmanager
+def configured_workspace(config, *, supports_extra_kv, flags=None, compact_gather=None):
+    kvcache = ModuleType("lightop.kvcache")
+    if compact_gather is not None:
+        kvcache.dsv4_gather_upconvert_compact_k_cache_paged = compact_gather
+    lightop = SimpleNamespace(op=Mock(), kvcache=kvcache)
+
+    def flash_mla(*, q, is_fp8_kvcache, extra_k_cache, **kwargs):
+        if not supports_extra_kv and not is_fp8_kvcache and extra_k_cache is not None:
+            raise RuntimeError("gfx936 BF16 DSA decode does not support extra_kv yet")
+        return q, None
+
+    kernel = Mock(side_effect=flash_mla)
+    obj = workspace_methods(
+        _is_hcu=True,
+        _hcu_flashmla_supports_bf16_extra_kv=lambda device: supports_extra_kv,
+        envs=envs,
+        print_warning_once=Mock(),
+        SWA_WINDOW=128,
+        PAGE_INDEX_ALIGNED_SIZE=64,
+        ceil_align=ceil_align,
+        _GraphBucket=(),
+        maybe_create_verify_mask=lambda **kwargs: None,
+        _get_logical_forward_mode=lambda batch: batch.forward_mode,
+        gather_upconvert_k_cache_paged=Mock(),
+        flash_mla_with_kvcache_entrypoint=kernel,
+    )
+    obj.token_to_kv_pool = SimpleNamespace(is_bf16_attention_kv_cache=False)
+    obj.is_dspark_draft = False
+    obj.is_draft_runner = False
+    obj.speculative_num_draft_tokens = None
+    obj.head_dim_v = 512
+    obj.index_topk = 512
+    obj.max_context_len = 2048
+    obj.softmax_scale = 512**-0.5
+    obj.flash_mla = kernel
+    with (
+        patch.dict(os.environ),
+        patch.dict(sys.modules, {"lightop": lightop, "lightop.kvcache": kvcache}),
+        patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+    ):
+        for flag in (
+            envs.SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA,
+            envs.SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER,
+            envs.SGLANG_DSV4_HCU_BF16_GATHER_DEDUP,
+        ):
+            os.environ.pop(flag.name, None)
+        os.environ.update(flags or {})
+        obj._init_dsv4_bf16_flashmla(config)
+        yield obj
+
+
+def flashmla_inputs(obj, ratio, *, mode="target_verify", extra_length=0):
+    def cache(page_size):
+        return torch.zeros((1, page_size, 1, 584), dtype=torch.uint8).as_subclass(
+            CudaLikeTensor
         )
-        method = next(
-            n
-            for n in cls.body
-            if isinstance(n, ast.FunctionDef) and n.name == "_forward_flash_mla_decode"
+
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: mode == "decode",
+            is_target_verify=lambda: mode == "target_verify",
+            is_draft_extend_v2=lambda: mode == "draft_extend_v2",
         )
-        mode = SimpleNamespace(is_decode=lambda: True)
-        scope = {
-            "torch": torch,
-            "Optional": Optional,
-            "Literal": Literal,
-            "ForwardBatch": object,
-            "_get_logical_forward_mode": lambda batch: mode,
+    )
+    obj._forward_flash_mla_decode(
+        q=torch.zeros((1, 128, 512), dtype=torch.bfloat16),
+        swa_k_cache=cache(256),
+        swa_page_indices=torch.zeros((1, 128), dtype=torch.int32),
+        swa_topk_lengths=torch.tensor([8], dtype=torch.int32),
+        extra_k_cache=cache({1: 256, 2: 128, 4: 64, 128: 16}[ratio]) if ratio else None,
+        extra_indices=torch.zeros((1, 64), dtype=torch.int32) if ratio else None,
+        extra_topk_lengths=torch.tensor([extra_length], dtype=torch.int32)
+        if ratio
+        else None,
+        flashmla_metadata=object(),
+        attn_sink=torch.zeros(128),
+        compress_ratio=ratio,
+        layer_id=0,
+        forward_batch=batch,
+    )
+    return obj.flash_mla.call_args.kwargs
+
+
+class TestBF16FlashMLACapability(CustomTestCase):
+    def test_old_flashmla_keeps_only_swa_on_lightop_bf16(self):
+        """A short compressed sequence still supplies an extra cache during capture."""
+        both_explicit = {
+            "SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA": "1",
+            "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER": "1",
         }
-        exec(
-            compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"),
-            scope,
+        for flags, compact in (({}, None), ({}, Mock()), (both_explicit, None)):
+            with (
+                self.subTest(flags=flags, compact=compact is not None),
+                configured_workspace(
+                    w4a8_config(),
+                    supports_extra_kv=False,
+                    flags=flags,
+                    compact_gather=compact,
+                ) as obj,
+            ):
+                obj.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
+                self.assertEqual(set(obj._dsv4_bf16_flashmla_workspaces), {"swa"})
+                with patch.object(
+                    torch.cuda, "is_current_stream_capturing", return_value=True
+                ):
+                    for mode in ("decode", "target_verify", "draft_extend_v2"):
+                        swa = flashmla_inputs(obj, 0, mode=mode)
+                        self.assertFalse(swa["is_fp8_kvcache"])
+                        self.assertEqual(swa["k_cache"].dtype, torch.bfloat16)
+                        self.assertIsNone(swa["extra_k_cache"])
+                    obj._dsv4_lightop_kvcache_op.dsv4_gather_upconvert_k_cache_paged.assert_called()
+                    for ratio in (1, 2, 4, 128):
+                        dual = flashmla_inputs(obj, ratio)
+                        self.assertTrue(dual["is_fp8_kvcache"])
+                        self.assertEqual(dual["extra_k_cache"].dtype, torch.uint8)
+                        self.assertEqual(dual["extra_topk_length"].item(), 0)
+                    self.assertTrue(
+                        flashmla_inputs(obj, 128, extra_length=3)["is_fp8_kvcache"]
+                    )
+                self.assertEqual(set(obj._dsv4_bf16_flashmla_workspaces), {"swa"})
+
+    def test_explicit_bf16_uses_combined_triton_gather_on_old_flashmla(self):
+        flags = {"SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA": "1"}
+        with configured_workspace(
+            w4a8_config(), supports_extra_kv=False, flags=flags
+        ) as obj:
+            obj.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
+            self.assertEqual(set(obj._dsv4_bf16_flashmla_workspaces), {"combined"})
+            self.assertFalse(obj._dsv4_lightop_bf16_gather)
+            self.assertFalse(obj._dsv4_bf16_gather_dedup)
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ):
+                dual = flashmla_inputs(obj, 128, extra_length=3)
+            self.assertFalse(dual["is_fp8_kvcache"])
+            self.assertEqual(dual["k_cache"].shape, (1, 128 + 64, 1, 512))
+            self.assertEqual(dual["topk_length"].item(), 8 + 3)
+            self.assertIsNone(dual["extra_k_cache"])
+            self.assertIsNone(dual["extra_indices_in_kvcache"])
+            self.assertIsNone(dual["extra_topk_length"])
+
+    def test_supported_flashmla_keeps_both_lightop_bf16_caches(self):
+        with configured_workspace(w4a8_config(), supports_extra_kv=True) as obj:
+            dual = flashmla_inputs(obj, 128, mode="decode", extra_length=3)
+            self.assertFalse(dual["is_fp8_kvcache"])
+            self.assertEqual(dual["k_cache"].dtype, torch.bfloat16)
+            self.assertEqual(dual["extra_k_cache"].dtype, torch.bfloat16)
+            self.assertEqual(dual["topk_length"].item(), 8)
+            self.assertEqual(dual["extra_topk_length"].item(), 3)
+            obj._dsv4_lightop_kvcache_op.dsv4_gather_upconvert_dual_k_cache_paged.assert_called_once()
+
+    def test_extra_kv_probe_caches_only_eager_results_per_device(self):
+        probe_name = "_hcu_flashmla_supports_bf16_extra_kv"
+        scope = load_functions(
+            [probe_name, "_probe_hcu_flashmla_bf16_extra_kv"],
+            _is_hcu=True,
+            PAGE_INDEX_ALIGNED_SIZE=64,
         )
+        probe = scope[probe_name]
+        grad_enabled = []
+
+        def new_metadata():
+            grad_enabled.append(torch.is_grad_enabled())
+            return object(), None
+
+        flash_mla = SimpleNamespace(
+            get_mla_metadata=new_metadata,
+            flash_mla_with_kvcache=Mock(
+                side_effect=[
+                    RuntimeError(
+                        "gfx936 BF16 DSA decode does not support EXTRA_KV yet"
+                    ),
+                    (None, None),
+                    RuntimeError("unrelated launch error"),
+                ]
+            ),
+        )
+        zeros = torch.zeros
+        with (
+            torch.enable_grad(),
+            patch.dict(sys.modules, {"flash_mla": flash_mla}),
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "current_device", return_value=0),
+            patch.object(torch.cuda, "device", return_value=nullcontext()),
+            patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ) as capturing,
+            patch.object(
+                torch,
+                "zeros",
+                side_effect=lambda shape, *, device, dtype: zeros(shape, dtype=dtype),
+            ),
+        ):
+            self.assertTrue(probe(torch.device("cuda")))
+            capturing.return_value = False
+            self.assertTrue(probe(torch.device("cpu")))
+            with patch.dict(scope, {"_is_hcu": False}):
+                self.assertTrue(probe(torch.device("cuda")))
+            with patch.object(torch.cuda, "is_available", return_value=False):
+                self.assertTrue(probe(torch.device("cuda")))
+            self.assertFalse(probe(torch.device("cuda")))
+            self.assertFalse(probe(torch.device("cuda:0")))
+            self.assertTrue(probe(torch.device("cuda:1")))
+            self.assertTrue(probe(torch.device("cuda:2")))
+            with patch.dict(sys.modules, {"flash_mla": None}):
+                self.assertTrue(probe(torch.device("cuda:3")))
+
+        calls = flash_mla.flash_mla_with_kvcache.call_args_list
+        self.assertEqual(grad_enabled, [False, False, False])
+        self.assertEqual(len({call.args[5] for call in calls}), 3)
+        args, kwargs = flash_mla.flash_mla_with_kvcache.call_args
+        self.assertEqual(args[0].shape, (1, 1, 128, 512))
+        self.assertFalse(kwargs["is_fp8_kvcache"])
+        self.assertEqual(kwargs["extra_k_cache"].dtype, torch.bfloat16)
+
+
+class TestBF16GatherModelDispatch(CustomTestCase):
+    def test_forward_caller_keeps_fallback_lazy_and_original_kwargs(self):
+        mode = SimpleNamespace(is_decode=lambda: True)
+        forward = load_functions(
+            ["_forward_flash_mla_decode"], _get_logical_forward_mode=lambda batch: mode
+        )["_forward_flash_mla_decode"]
         args = dict(
             q=torch.zeros((12, 1, 512)),
             swa_k_cache=torch.zeros((1, 256, 1, 584), dtype=torch.uint8),
@@ -166,7 +388,7 @@ class TestBF16GatherModelDispatch(unittest.TestCase):
                     return_value=torch.zeros((12, 1, 512))
                 ),
             )
-            scope[method.name](obj, **args)
+            forward(obj, **args)
             obj._try_prepare_dsv4_w4a8_bf16_inputs.assert_called_once()
             if compact_result is None:
                 obj._prepare_dsv4_bf16_flashmla_inputs.assert_called_once()
@@ -185,58 +407,26 @@ class TestBF16GatherModelDispatch(unittest.TestCase):
                 obj._use_dsv4_bf16_gather_dedup.assert_not_called()
 
     def test_initialization_only_reserves_reuse_lengths_for_w4a8(self):
-        root = Path(__file__).resolve().parents[5]
-        source = root / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
-        cls = next(
-            n
-            for n in ast.parse(source.read_text()).body
-            if isinstance(n, ast.ClassDef) and n.name == "DeepseekV4AttnBackend"
-        )
-        init = next(
-            n
-            for n in cls.body
-            if isinstance(n, ast.FunctionDef) and n.name == "__init__"
-        )
-        names = {
-            "_dsv4_bf16_gather_family",
-            "_dsv4_compact_gather_enabled",
-            "_dsv4_query_reuse_zero_lengths",
-        }
-        selected = [
-            n
-            for n in init.body
-            if isinstance(n, ast.Assign)
-            and any(isinstance(t, ast.Attribute) and t.attr in names for t in n.targets)
-        ]
-        self.assertEqual(len(selected), 3)
-        code = compile(ast.Module(body=selected, type_ignores=[]), str(source), "exec")
         for config, enabled in (
             (w4a8_config(), True),
             ({"quant_method": "fp8"}, False),
             ({}, False),
         ):
-            obj = workspace_methods()
-            obj._dsv4_lightop_bf16_gather = True
-            scope = {
-                "self": obj,
-                "torch": torch,
-                "model_runner": SimpleNamespace(
-                    model_config=SimpleNamespace(hf_quant_config=config)
-                ),
-                "_dsv4_bf16_gather_model_family": model_family,
-            }
-            exec(code, scope)
-            self.assertEqual(obj._dsv4_compact_gather_enabled, enabled)
-            self.assertEqual(obj._dsv4_query_reuse_zero_lengths is not None, enabled)
+            with configured_workspace(config, supports_extra_kv=True) as obj:
+                self.assertEqual(obj._dsv4_compact_gather_enabled, enabled)
+                self.assertEqual(
+                    obj._dsv4_query_reuse_zero_lengths is not None, enabled
+                )
 
     def test_matching_verify_shape_only_uses_compact_for_w4a8(self):
-        for family, provide_api in (
-            ("w4a8", True),
-            ("w4a8", False),
-            ("fp8", True),
-            ("original", True),
+        for family, compact_api in (
+            ("w4a8", "callable"),
+            ("w4a8", "missing"),
+            ("w4a8", "noncallable"),
+            ("fp8", "callable"),
+            ("original", "callable"),
         ):
-            with self.subTest(family=family, provide_api=provide_api):
+            with self.subTest(family=family, compact_api=compact_api):
                 obj = workspace_methods()
                 obj._dsv4_compact_gather_enabled = family == "w4a8"
                 obj._dsv4_lightop_bf16_gather = True
@@ -248,8 +438,10 @@ class TestBF16GatherModelDispatch(unittest.TestCase):
                 package, api = ModuleType("lightop"), ModuleType("lightop.kvcache")
                 package.__path__ = []
                 package.kvcache = api
-                if provide_api:
+                if compact_api == "callable":
                     api.dsv4_gather_upconvert_compact_k_cache_paged = compact
+                elif compact_api == "noncallable":
+                    api.dsv4_gather_upconvert_compact_k_cache_paged = object()
                 cache = torch.zeros((1, 256, 1, 584), dtype=torch.uint8).as_subclass(
                     CudaLikeTensor
                 )
@@ -277,7 +469,7 @@ class TestBF16GatherModelDispatch(unittest.TestCase):
                     )
                     if result is None:
                         obj._prepare_dsv4_bf16_flashmla_inputs(**inputs)
-                if family == "w4a8" and provide_api:
+                if family == "w4a8" and compact_api == "callable":
                     compact.assert_called_once()
                     plain.assert_not_called()
                     self.assertEqual(compact.call_args.kwargs["reuse_group"], 6)
@@ -353,7 +545,7 @@ class TestBF16GatherModelDispatch(unittest.TestCase):
         self.assertFalse(obj._dsv4_bf16_flashmla_workspaces)
 
 
-class TestBF16GatherWorkspace(unittest.TestCase):
+class TestBF16GatherWorkspace(CustomTestCase):
     def test_old_lightop_without_compact_api_keeps_single_gather(self):
         obj = workspace_methods()
         obj._dsv4_lightop_bf16_gather = True
