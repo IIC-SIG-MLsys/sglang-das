@@ -1,6 +1,6 @@
-"""Utilities for JSON serialization in HTTP responses."""
+"""Utilities for JSON HTTP responses and SSE frames."""
 
-from typing import Any
+from typing import Any, overload
 
 import orjson
 from fastapi.responses import Response
@@ -15,6 +15,25 @@ ORJSON_RESPONSE_OPTIONS = orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY
 def dumps_json(content: Any) -> bytes:
     """Serialize content to JSON bytes using SGLang's ORJSON options."""
     return orjson.dumps(content, option=ORJSON_RESPONSE_OPTIONS)
+
+
+@overload
+def format_sse_json(payload: bytes) -> bytes: ...
+
+
+@overload
+def format_sse_json(payload: str) -> str: ...
+
+
+def format_sse_json(payload: bytes | str) -> bytes | str:
+    """Frame serialized JSON without triggering legacy PD routers' [DONE] scan."""
+    # In valid JSON the match is always inside a string (including object keys).
+    # RFC 8259 allows the colon to be written as \u003a with the same decoded value.
+    if isinstance(payload, bytes):
+        payload = payload.replace(b"data: [DONE]", rb"data\u003a [DONE]")
+        return b"data: " + payload + b"\n\n"
+    payload = payload.replace("data: [DONE]", r"data\u003a [DONE]")
+    return f"data: {payload}\n\n"
 
 
 class SGLangORJSONResponse(Response):

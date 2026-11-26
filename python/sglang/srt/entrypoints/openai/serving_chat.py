@@ -91,7 +91,6 @@ from sglang.srt.entrypoints.openai.utils import (
     process_spec_tokens_details_from_ret,
     should_include_usage,
     spec_tokens_details_from_meta_info,
-    to_openai_style_logprobs,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
@@ -122,6 +121,7 @@ from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
 from sglang.srt.utils import ImageData
+from sglang.srt.utils.json_response import format_sse_json
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
 if TYPE_CHECKING:
@@ -2392,7 +2392,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             code.name,
                             code.value,
                         )
-                        yield f"data: {error}\n\n"
+                        yield format_sse_json(error)
                         error_aborted = True
                         break
                     finish_reasons[index] = finish_reason
@@ -2476,7 +2476,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             ],
                             model=request.model,
                         )
-                        yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+                        yield format_sse_json(hidden_states_chunk.model_dump_json())
 
             sglext_routed = None
             if request.return_routed_experts and routed_experts:
@@ -2537,7 +2537,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         model=request.model,
                         sglext=sglext_non_ids,
                     )
-                    yield f"data: {sglext_chunk.model_dump_json()}\n\n"
+                    yield format_sse_json(sglext_chunk.model_dump_json())
                 if sglext_ids is not None:
                     sglext_ids_chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],
@@ -2546,7 +2546,8 @@ class OpenAIServingChat(OpenAIServingBase):
                         model=request.model,
                         sglext=sglext_ids,
                     )
-                    yield f"event: sglext_ids\ndata: {sglext_ids_chunk.model_dump_json()}\n\n"
+                    data = format_sse_json(sglext_ids_chunk.model_dump_json())
+                    yield f"event: sglext_ids\n{data}"
             elif sglext_non_ids is not None or sglext_ids is not None:
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -2555,7 +2556,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     model=request.model,
                     sglext=sglext_full,
                 )
-                yield f"data: {sglext_chunk.model_dump_json()}\n\n"
+                yield format_sse_json(sglext_chunk.model_dump_json())
 
             # Additional usage chunk
             if include_usage:
@@ -2599,13 +2600,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     usage=usage,
                     metadata=metadata,
                 )
-                yield f"data: {usage_chunk.model_dump_json()}\n\n"
+                yield format_sse_json(usage_chunk.model_dump_json())
 
         except ValueError as e:
             if not stream_started:
                 raise
             error = self.create_streaming_error_response(str(e))
-            yield f"data: {error}\n\n"
+            yield format_sse_json(error)
 
         yield "data: [DONE]\n\n"
 
@@ -3521,7 +3522,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield format_sse_json(chunk.model_dump_json())
 
         # Yield tool calls
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
@@ -3574,7 +3575,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield format_sse_json(chunk.model_dump_json())
 
     def _check_for_unstreamed_tool_args(
         self,
@@ -3649,6 +3650,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 model=request.model,
             )
 
-            return f"data: {chunk.model_dump_json()}\n\n"
+            return format_sse_json(chunk.model_dump_json())
 
         return None
