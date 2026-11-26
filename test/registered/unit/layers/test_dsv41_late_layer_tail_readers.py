@@ -230,6 +230,7 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
         fb.init_mlp_sync_metadata(
             SimpleNamespace(
                 global_num_tokens=[n, 0],
+                global_cp_num_tokens=None,
                 global_num_tokens_for_logprob=[1, 0],
                 dp_spec_prefill_coordination_applied=False,
                 draft_global_num_tokens=None,

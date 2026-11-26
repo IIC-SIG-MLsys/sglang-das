@@ -319,6 +319,25 @@ def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
     return (output_tensor, input_tensor, event, cp_size)
 
 
+@lru_cache(maxsize=4096)
+def _cp_interleave_cycle_within(rows, cp_size, limit):
+    """True when no cycle of the rank-major -> token-major row permutation
+    exceeds ``limit`` rows.
+
+    The permutation maps row i to i * (rows // cp_size) mod (rows - 1), so its
+    longest cycle is the multiplicative order of cp_size modulo rows - 1.
+    """
+    modulus = rows - 1
+    if modulus <= 1:
+        return True
+    value = cp_size % modulus
+    for _ in range(limit):
+        if value == 1:
+            return True
+        value = value * cp_size % modulus
+    return False
+
+
 def _use_inplace_cp_output(tensor):
     from sglang.srt.environ import envs
     from sglang.srt.utils import is_hcu
@@ -330,16 +349,42 @@ def _use_inplace_cp_output(tensor):
     )
 
 
-@lru_cache(maxsize=64)
 def _cp_interleave_has_long_cycle(rows, cp_size, min_cycle_rows):
-    # The interior row permutation multiplies by cp_size modulo rows - 1.
-    # All interior row periods divide the period of row 1.
-    row = 1
-    for _ in range(1, min_cycle_rows):
-        row = row * cp_size % (rows - 1)
-        if row == 1:
-            return False
-    return True
+    return not _cp_interleave_cycle_within(rows, cp_size, min_cycle_rows - 1)
+
+
+@lru_cache(maxsize=1)
+def _lightop_cp_output_reorder():
+    try:
+        from lightop.attention.cp_output import interleave_cp_output_
+    except ImportError:
+        return None
+    return interleave_cp_output_
+
+
+def _cp_output_reorder_method(tensor, rows, cp_size):
+    from sglang.srt.environ import envs
+
+    if not _use_inplace_cp_output(tensor):
+        return None
+    row_width = tensor.numel() // max(tensor.shape[0], 1)
+    if (
+        cp_size == 8
+        and rows > cp_size
+        and rows % cp_size == 0
+        and row_width in (512, 5120)
+        and tensor.element_size() == 2
+        and tensor.is_contiguous()
+        and not tensor.requires_grad
+        and _cp_interleave_has_long_cycle(
+            rows, cp_size, 512 if row_width == 5120 else 256
+        )
+    ):
+        return _interleave_cp_output_tiled_ if row_width == 5120 else None
+    limit = envs.SGLANG_DSV4_CP_OUTPUT_INPLACE_MAX_CYCLE.get()
+    if limit > 0 and not _cp_interleave_cycle_within(rows, cp_size, limit):
+        return None
+    return _lightop_cp_output_reorder()
 
 
 def _interleave_cp_output_tiled_(output_tensor, cp_size):
@@ -365,27 +410,9 @@ def _interleave_cp_output(output_tensor, cp_size):
     original rank-major layout. Only the ordinary equal-share interleave path
     uses this helper. Bounded-replay gather_index retains its compact selection.
     """
-    if _use_inplace_cp_output(output_tensor):
-        rows = output_tensor.shape[0]
-        row_width = output_tensor.numel() // max(rows, 1)
-        use_copy = (
-            cp_size == 8
-            and rows > cp_size
-            and rows % cp_size == 0
-            and row_width in (512, 5120)
-            and output_tensor.element_size() == 2
-            and output_tensor.is_contiguous()
-            and not output_tensor.requires_grad
-            and _cp_interleave_has_long_cycle(
-                rows, cp_size, 512 if row_width == 5120 else 256
-            )
-        )
-        if not use_copy:
-            from lightop.attention.cp_output import interleave_cp_output_
-
-            return interleave_cp_output_(output_tensor, cp_size)
-        if row_width == 5120:
-            return _interleave_cp_output_tiled_(output_tensor, cp_size)
+    method = _cp_output_reorder_method(output_tensor, output_tensor.shape[0], cp_size)
+    if method is not None:
+        return method(output_tensor, cp_size)
     out_shape = output_tensor.shape
     return (
         output_tensor.view(cp_size, -1, *out_shape[1:])
@@ -440,7 +467,10 @@ def cp_all_gather_rerange_output(
             chunk_large_output
             and input_tensor.ndim == 2
             and gather_index is None
-            and not _use_inplace_cp_output(input_tensor)
+            and _cp_output_reorder_method(
+                input_tensor, input_tensor.shape[0] * cp_size, cp_size
+            )
+            is None
         ):
             from sglang.srt.layers.cp.interleave import (
                 _gather_interleaved_tensor_chunked,

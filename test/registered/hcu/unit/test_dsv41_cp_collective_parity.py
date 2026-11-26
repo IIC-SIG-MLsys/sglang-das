@@ -12,6 +12,7 @@ import torch.distributed as dist
 
 from sglang.kernels.ops.attention.dsv4 import fused_k_norm_rope_flashmla
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.gemm import bf16_fp32
 from sglang.srt.distributed.parallel_state import init_model_parallel_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend as backend
@@ -167,10 +168,6 @@ class TestDsv41CPCollectiveParity(CustomTestCase):
                     )
                 )
 
-    @unittest.skipUnless(
-        envs.SGLANG_OPT_DSV41_CP_LOCAL_COMPRESSOR_PROJECTION.get(),
-        "set SGLANG_OPT_DSV41_CP_LOCAL_COMPRESSOR_PROJECTION=1 to check the local GEMM",
-    )
     @torch.inference_mode()
     def test_local_projection_matches_global_gemm_bits(self):
         for rows in (32768, 16384, 6784):
@@ -184,24 +181,41 @@ class TestDsv41CPCollectiveParity(CustomTestCase):
             ).add_(self.rank / 16)
             global_x = cp_materialize_global_token_order(local, batch)
             for ratio in (1, 2):
-                with self.subTest(rows=rows, ratio=ratio):
-                    compressor = DeepseekV41Compressor(5120, 512, ratio, 1e-6).cuda()
-                    weight = (
-                        compressor.wkv if ratio == 1 else compressor.wkv_gate
-                    ).weight
-                    weight.normal_(std=5120**-0.5, generator=self.gen)
-                    expected = compressor.project(global_x)
-                    actual = backend._gather_cp_compressor_projection(compressor, local)
-                    for value, reference in zip(actual, expected, strict=True):
-                        if reference is None:
-                            self.assertIsNone(value)
-                        else:
-                            self.assertTrue(
-                                torch.equal(
-                                    value.view(torch.uint8), reference.view(torch.uint8)
-                                ),
-                                f"local GEMM rounding differs at {rows=} {ratio=}",
-                            )
+                compressor = DeepseekV41Compressor(5120, 512, ratio, 1e-6).cuda()
+                weight = (compressor.wkv if ratio == 1 else compressor.wkv_gate).weight
+                weight.normal_(std=5120**-0.5, generator=self.gen)
+                # rocBLAS NN can choose different tiles for M=848 and M=6784.
+                # Rerun these same operands with NN off to isolate the collective.
+                tail_c2 = rows == 6784 and ratio == 2
+                for nn_enabled in (True, False) if tail_c2 else (True,):
+                    with (
+                        self.subTest(rows=rows, ratio=ratio, rocblas_nn=nn_enabled),
+                        patch.object(bf16_fp32, "_HCU_ROCBLAS_NN_ENABLED", nn_enabled),
+                    ):
+                        expected = compressor.project(global_x)
+                        actual = backend._gather_cp_compressor_projection(
+                            compressor, local
+                        )
+                        for value, reference in zip(actual, expected, strict=True):
+                            if reference is None:
+                                self.assertIsNone(value)
+                            elif tail_c2 and nn_enabled:
+                                # NN returns BF16 rounded values widened to FP32.
+                                # nextafter takes at most one BF16 step toward value;
+                                # small atol covers K=5120 near-zero cancellation.
+                                adjacent = torch.nextafter(
+                                    reference.bfloat16(), value.bfloat16()
+                                )
+                                torch.testing.assert_close(
+                                    value, adjacent.float(), rtol=0, atol=1e-4
+                                )
+                            else:
+                                self.assertTrue(
+                                    torch.equal(
+                                        value.view(torch.uint8),
+                                        reference.view(torch.uint8),
+                                    )
+                                )
             del global_x
 
 

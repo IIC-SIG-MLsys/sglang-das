@@ -13,6 +13,18 @@ FP4_BLOCK_SIZE = 32
 FP4_AMAX_FLOOR = 6 * 2.0**-126
 
 
+def rope_tail(
+    x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inverse: bool = False
+) -> torch.Tensor:
+    """Rotate the last rope_dim features of x with complex freqs [T, rope_dim // 2]."""
+    head, tail = x[..., :-rope_dim], x[..., -rope_dim:]
+    tc = torch.view_as_complex(tail.float().unflatten(-1, (-1, 2)).contiguous())
+    f = freqs.conj() if inverse else freqs
+    f = f.view(x.shape[0], *([1] * (x.ndim - 2)), rope_dim // 2)
+    rotated = torch.view_as_real(tc * f).flatten(-2).to(x.dtype)
+    return torch.cat([head, rotated], dim=-1)
+
+
 def ceil_pow2(x: torch.Tensor) -> torch.Tensor:
     """2 ** ceil(log2(x)) for positive fp32 x, computed on the IEEE bits so the
     result is exact at powers of two."""

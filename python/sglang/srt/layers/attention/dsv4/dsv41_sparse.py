@@ -7,6 +7,7 @@ share that storage.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
+    rope_tail,
 )
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
@@ -26,6 +28,16 @@ from sglang.srt.utils import add_prefix, is_gfx95_supported, is_hcu
 
 
 _is_hcu = is_hcu()
+_use_indexer_prep = (
+    _is_hcu and os.environ.get("SGLANG_HCU_OPT_INDEXER_PREP", "1") == "1"
+)
+if _use_indexer_prep:
+    try:
+        from lightop.attention import dsv41_indexer_rope_fake_quant
+    except ImportError:
+        dsv41_indexer_rope_fake_quant = None
+        _use_indexer_prep = False
+
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
     # validated on CUDA and gfx950; other ROCm GPUs keep the torch forms
@@ -43,6 +55,18 @@ def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
         return rope_tail_fake_quant_fp4(
             x, freqs, rope_dim, compressed_kv=compressed_kv, positions=positions
         )
+    if (
+        _use_indexer_prep
+        and not compressed_kv
+        and positions is not None
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.ndim == 3
+        and x.shape[-1] == 128
+        and rope_dim == 64
+        and x.is_contiguous()
+    ):
+        return dsv41_indexer_rope_fake_quant(x, freqs, positions)
     if positions is not None:
         freqs = freqs[positions]
     # HIP/DCU: fused sgl-kernel AOT path.
@@ -131,18 +155,6 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     )
 
 
-def rope_tail(
-    x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inverse: bool = False
-) -> torch.Tensor:
-    """Rotate the last rope_dim features of x with complex freqs [T, rope_dim // 2]."""
-    head, tail = x[..., :-rope_dim], x[..., -rope_dim:]
-    tc = torch.view_as_complex(tail.float().unflatten(-1, (-1, 2)).contiguous())
-    f = freqs.conj() if inverse else freqs
-    f = f.view(x.shape[0], *([1] * (x.ndim - 2)), rope_dim // 2)
-    rotated = torch.view_as_real(tc * f).flatten(-2).to(x.dtype)
-    return torch.cat([head, rotated], dim=-1)
-
-
 def fused_low_ratio_compress_supported() -> bool:
     """The fused c1 / c2 / index-K decode kernels need sm100+ on CUDA (they pack fp4
     with `cvt.rn.satfinite.e2m1x2`) or gfx950 on ROCm; the answer also fixes the
@@ -203,6 +215,19 @@ class DeepseekV41Compressor(nn.Module):
         kv = linear_bf16_fp32(x, self.wkv.weight)
         score = linear_bf16_fp32(x, self.wgate.weight)
         return kv, score
+
+    def project_packed(self, x: torch.Tensor) -> torch.Tensor:
+        """Project local CP rows into one contiguous collective payload.
+
+        Reuse the loaded fused gate layout without splitting and concatenating
+        it again. The separate-weight layout keeps its existing two GEMMs.
+        """
+        if self.compress_ratio == 1:
+            return self.wkv(x)
+        if self.use_fused_gate:
+            return self.project_fused(x)
+        kv, score = self.project(x)
+        return torch.cat((kv, score), dim=-1)
 
     def project_fused(self, x: torch.Tensor) -> torch.Tensor:
         """`[n, 2D]` fp32, `| kv | score |`."""

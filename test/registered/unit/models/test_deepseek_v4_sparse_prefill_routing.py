@@ -89,13 +89,13 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                 self.assertTrue((selected[2, 2:] == -1).all())
                 torch.testing.assert_close(scores, original_scores)
 
-    def test_non_hcu_ragged_topk_preserves_cuda_and_xpu_routing(self):
+    def test_ragged_topk_without_lightop_preserves_routing_and_offsets(self):
         scores = torch.tensor([[9, 4, 7, 1]], dtype=torch.float32)
         lengths = torch.tensor([3], dtype=torch.int32)
         starts = torch.tensor([1], dtype=torch.int32)
         offsets = torch.tensor([20], dtype=torch.int32)
-        for use_xpu in (False, True):
-            with self.subTest(xpu=use_xpu):
+        for hcu, use_xpu in ((True, False), (False, False), (False, True)):
+            with self.subTest(hcu=hcu, xpu=use_xpu):
                 selected = torch.full((1, 2), -2, dtype=torch.int32)
                 cuda_transform = Mock(
                     side_effect=lambda scores, lengths, starts, offsets, selected: (
@@ -120,7 +120,8 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                     )
                 )
                 with (
-                    patch.object(dsv4_topk, "_IS_HCU", False),
+                    patch.dict("sys.modules", {"lightop": ModuleType("lightop")}),
+                    patch.object(dsv4_topk, "_IS_HCU", hcu),
                     patch.object(dsv4_topk, "is_xpu", return_value=use_xpu),
                     patch.object(
                         dsv4_topk,
@@ -159,11 +160,12 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
 
     def _apply_hip_defaults(self):
         cfg = SimpleNamespace(
-            dsv4_attn_backend="auto",
+            dsv4_attn_backend="flashmla",
             max_running_requests=1,
             speculative_algorithm=None,
         )
         with (
+            patch("sglang.srt.arg_groups.deepseek_v4_hook._is_hcu", True),
             patch(
                 "sglang.srt.arg_groups.deepseek_v4_hook.get_platform",
                 return_value=SimpleNamespace(is_hip=True),
@@ -208,15 +210,16 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                 )
             )
 
-    def test_legacy_v4_sparse_prefill_still_rejects_cp(self):
+    def test_legacy_v4_sparse_prefill_rejects_cp_by_default(self):
         q = SimpleNamespace(shape=(128, 1, 8, 512))
         with (
             patch.object(deepseek_v4_backend, "_is_sm120", False),
             patch.object(
                 deepseek_v4_backend, "dsa_use_prefill_cp", return_value=True
             ),
-            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
+            patch.dict(os.environ),
         ):
+            envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.clear()
             self.assertFalse(
                 deepseek_v4_backend._should_use_sparse_prefill(
                     q, SimpleNamespace(), allow_cp=False
@@ -274,6 +277,7 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
         positions = torch.arange(num_local + 2, dtype=torch.int32) * 8 + rank
         captured = {}
         with (
+            patch.object(deepseek_v4_backend, "_is_hcu", True),
             patch.object(
                 deepseek_v4_backend,
                 "get_parallel",
@@ -374,6 +378,7 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
 
     def _mqa_prep_fixture(self, rank=7):
         backend, batch, _ = self._indexer_fixture([3, 0, 13])
+        backend.dsv41_hcu_indexer_kernels = False
         batch.forward_mode = deepseek_v4_backend.ForwardMode.EXTEND
         batch.extend_start_loc = torch.tensor([0, 3, 3], dtype=torch.int32)
         batch.req_pool_indices = torch.tensor([5, 2, 7], dtype=torch.int64)
@@ -399,6 +404,7 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
         pool = deepseek_v4_memory_pool.DeepSeekV4TokenToKVPool.__new__(
             deepseek_v4_memory_pool.DeepSeekV4TokenToKVPool
         )
+        pool.layer_transfer_counter = None
         pool.layer_mapping = {2: (1, 3, 0), 8: (1, 3, 0), 14: (2, 5, 0)}
         pool.index_pools = {}
         for ratio, start_layer in ((1, 3), (2, 5)):
@@ -431,10 +437,27 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
         lightop.dsv41_mqa_query_lens = Mock(side_effect=self._mqa_query_lens_reference)
         lightop.dsv41_mqa_prefill_metadata = Mock(side_effect=self._mqa_metadata_reference)
         lightop.dsv41_gather_index_k_fp4 = Mock(side_effect=self._mqa_gather_reference)
-        stack.enter_context(patch.dict("sys.modules", {"lightop": lightop}))
+        stack.enter_context(
+            patch.dict(
+                "sys.modules",
+                {
+                    "lightop": lightop,
+                    "lightop.attention": ModuleType("lightop.attention"),
+                },
+            )
+        )
         stack.enter_context(patch.object(deepseek_v4_backend, "_is_hcu", True))
         stack.enter_context(
-            patch.object(deepseek_v4_backend, "_hcu_mqa_prep_available", return_value=True)
+            patch.object(
+                deepseek_v4_backend,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="prefill"),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                deepseek_v4_backend, "_hcu_mqa_prep_available", return_value=True
+            )
         )
         stack.enter_context(
             patch.object(backend, "_use_dense_fp4_prefill_indexer", return_value=True)
@@ -696,12 +719,13 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
         metadata = backend.forward_metadata
         with stack:
             first = backend._low_ratio_hcu_query_lens(batch, pos, q_cpu)
-            for invalidate in (
-                metadata.copy_, metadata.refresh_for_breakable_cuda_graph_replay_,
+            for invalidate, kwargs in (
+                (metadata.copy_, {}),
+                (metadata.refresh_for_breakable_cuda_graph_replay_, {"two_level": False}),
             ):
                 metadata.low_ratio_dense_metadata[1] = object()
                 invalidate(
-                    deepseek_v4_backend.DSV4Metadata(metadata.core_metadata, None)
+                    deepseek_v4_backend.DSV4Metadata(metadata.core_metadata, None), **kwargs,
                 )
                 self.assertIsNone(metadata.low_ratio_query_lens)
                 self.assertEqual(metadata.low_ratio_dense_metadata, {})
@@ -710,6 +734,19 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                 self.assertIsNot(fresh, first)
                 first = fresh
         self.assertEqual(lightop.dsv41_mqa_query_lens.call_count, 3)
+
+    def test_old_lightop_gathers_fp4_payload_and_scales_by_slot(self):
+        backend, *_ = self._mqa_prep_fixture()
+        pool = backend.token_to_kv_pool.index_pools[1]
+        cache = pool.index_k_with_scale_buffer[0]
+        slots = torch.tensor([256, 1, 127, 128, 1], dtype=torch.int32)
+        with patch.dict("sys.modules", {"lightop": ModuleType("lightop")}):
+            payload, scales = pool.get_index_k_fp4(
+                pool.start_layer, slots, use_hcu_fused_gather=True
+            )
+        expected = self._mqa_gather_reference(cache, slots, pool.page_size)
+        self.assertTrue(torch.equal(payload, expected[0]))
+        self.assertTrue(torch.equal(scales, expected[1]))
 
     def test_hcu_mqa_prep_preserves_logits_and_physical_source_mapping(self):
         backend, batch, layer, pos, q_cpu, pages, raw = self._mqa_prep_fixture()
@@ -837,6 +874,7 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
         q_lora = torch.arange(12).reshape(4, 3)
         positions = torch.tensor([7, 15, -1, -1], dtype=torch.int32)
         with (
+            patch.object(deepseek_v4_backend, "_is_hcu", True),
             patch.object(
                 deepseek_v4_backend,
                 "get_parallel",
@@ -1510,6 +1548,7 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                 )
                 tail = SimpleNamespace(
                     cp_metadata=cp_metadata,
+                    real_rows_count=None,
                     local_lens_cpu=tail_lens,
                     # CP must select local rows, not these global tail lengths.
                     extend_seq_lens_cpu=[24, 16, 0] if use_cp else tail_lens,
@@ -1524,7 +1563,12 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                     core_attn_metadata=SimpleNamespace(low_ratios=[]),
                 )
                 backend.token_to_kv_pool = SimpleNamespace(request_window=None)
-                batch = SimpleNamespace(attn_cp_metadata=object())
+                batch = SimpleNamespace(
+                    attn_cp_metadata=object(),
+                    global_num_token_non_padded_cpu=None,
+                    global_num_token_non_padded=None,
+                    num_token_non_padded=None,
+                )
                 previous_cp = batch.attn_cp_metadata
                 with (
                     patch.object(

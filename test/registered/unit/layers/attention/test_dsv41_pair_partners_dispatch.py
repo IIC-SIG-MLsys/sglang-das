@@ -104,18 +104,19 @@ class TestDSV41PairPartnersDispatch(CustomTestCase):
         }):
             self.assert_torch_result(self.run_method())
 
-    def test_missing_native_is_not_silently_ignored(self):
+    def test_missing_native_falls_back_unless_explicitly_requested(self):
         self.ns["_is_hcu"] = True
         before = self.packed.clone()
-        for flag in (None, "1"):
+        for flag in ("1", None):
             with self.subTest(flag=flag), patch.dict(os.environ), patch.dict("sys.modules", {"lightop.attention": SimpleNamespace()}):
                 if flag is None:
                     os.environ.pop(FLAG, None)
+                    self.assert_torch_result(self.run_method())
                 else:
                     os.environ[FLAG] = flag
-                with self.assertRaises(ImportError):
-                    self.run_method()
-        torch.testing.assert_close(self.packed, before)
+                    with self.assertRaises(ImportError):
+                        self.run_method()
+                    torch.testing.assert_close(self.packed, before)
 
     def test_empty_batch_returns_inputs_without_import_or_state_update(self):
         self.ns["_is_hcu"] = True

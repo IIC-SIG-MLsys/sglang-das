@@ -1,8 +1,9 @@
 """CPU regression tests for bounded interleave hidden-state gathers."""
 
+import sys
 import unittest
 from contextlib import ExitStack, nullcontext
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest import mock
 
 import torch
@@ -175,6 +176,20 @@ class TestInterleaveCpGatherMemory(CustomTestCase):
         for kwargs in (dict(small=True), dict(indexed=True), dict(hcu=False)):
             with self.subTest(**kwargs):
                 self.assertEqual(len(self._gather(legacy=True, **kwargs)), 1)
+
+    def test_legacy_lightop_without_interleave_preserves_order_and_chunking(self):
+        hcu_cp_utils._lightop_cp_output_reorder.cache_clear()
+        self.addCleanup(hcu_cp_utils._lightop_cp_output_reorder.cache_clear)
+        with (
+            mock.patch.dict(
+                sys.modules, {"lightop.attention.cp_output": ModuleType("cp_output")}
+            ),
+            mock.patch.object(
+                hcu_cp_utils, "_use_inplace_cp_output", return_value=True
+            ),
+        ):
+            self.assertEqual(len(self._gather(legacy=True, small=True)), 1)
+            self.assertGreater(len(self._gather(legacy=True)), 1)
 
     def test_legacy_cp8_adaptive_output_preserves_token_order(self):
         cp_size, rows = 8, 1032

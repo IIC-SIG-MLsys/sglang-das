@@ -184,20 +184,43 @@ class TestChannelwiseRuntime(unittest.TestCase):
         self.assertEqual(layer.weight_scale_inv[3].item(), 0)
 
     def test_grouped_keeps_group_scale_alignment(self):
-        x = torch.randn(5, 2, 8)
+        from sglang.kernels.ops.quantization import fp8_kernel
+
+        x = (torch.arange(80).reshape(5, 2, 8) % 5 - 2).bfloat16()
+        weight = (torch.arange(48).reshape(6, 8) % 3 - 1).to(torch.float8_e4m3fn)
         layer = SimpleNamespace(
-            weight=torch.randn(6, 8), weight_scale_inv=torch.arange(6).reshape(6, 1)
+            weight=weight, weight_scale_inv=torch.arange(6).float().reshape(6, 1)
         )
 
-        def project(a, w, s):
-            self.assertEqual(a.shape, (2, 5, 8))
-            torch.testing.assert_close(s[:, :, 0], torch.arange(6).reshape(2, 3))
-            return torch.matmul(a, w.transpose(-1, -2))
+        def quant(rows):
+            scales = torch.where(rows[..., :1] > 0, 2.0, 1.0)
+            return (rows / scales).to(torch.float8_e4m3fn), scales
 
-        with patch.object(runtime, "linear", side_effect=project):
-            actual = runtime.grouped(x, layer, 2, 3)
-        expected = torch.einsum("tgd,grd->tgr", x, layer.weight.reshape(2, 3, 8))
-        torch.testing.assert_close(actual, expected)
+        def gemm(a, b, out):
+            out.copy_((a[0].float() * a[1]) @ (b[0].float() * b[1]).transpose(-1, -2))
+
+        dequantized = (weight.float() * layer.weight_scale_inv).view(2, 3, 8)
+        expected = torch.einsum("tgd,grd->tgr", x.float(), dequantized).bfloat16()
+        # The first wheel lacks FP8 quantization; the second accepts one row
+        # dimension only. Both must quantize WoB over each token's full width.
+        for api in (SimpleNamespace(), SimpleNamespace(per_token_quant_fp8=quant)):
+            with (
+                self.subTest(api=api),
+                patch.dict(
+                    sys.modules,
+                    {"lightop.quant": api, "deepgemm": SimpleNamespace(fp8_gemm=gemm)},
+                ),
+                patch.object(fp8_kernel, "per_token_quant_fp8", side_effect=quant),
+            ):
+                actual = runtime.grouped(x, layer, 2, 3)
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                q, scales, dtype = runtime.grouped(x, layer, 2, 3, quantize_output=True)
+                expected_q, expected_scales = quant(expected.flatten(1))
+                self.assertIs(dtype, x.dtype)
+                self.assertTrue(
+                    torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
+                )
+                torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
 
     def test_fp32_batches_dispatch_separately(self):
         x = torch.randn(2, 3, 8)

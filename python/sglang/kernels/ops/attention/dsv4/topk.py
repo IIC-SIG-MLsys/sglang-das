@@ -230,16 +230,19 @@ def topk_transform_ragged_v2(
     ``seq_lens`` entries must be NON-NEGATIVE, as for the paged entry point.
     """
     if _IS_HCU:
-        from lightop import topk_transform_ragged_v2 as hcu_topk_transform_ragged_v2
-
-        hcu_topk_transform_ragged_v2(
-            scores,
-            seq_lens,
-            out_offsets=out_offsets,
-            out_indices=out_indices,
-            row_starts=row_starts,
-        )
-        return
+        try:
+            from lightop import topk_transform_ragged_v2 as hcu_topk
+        except ImportError:
+            pass  # Older wheels use the in-tree ROCm ragged kernel below.
+        else:
+            hcu_topk(
+                scores,
+                seq_lens,
+                out_offsets=out_offsets,
+                out_indices=out_indices,
+                row_starts=row_starts,
+            )
+            return
     if is_xpu():
         torch.ops.sgl_kernel.topk_transform_ragged(
             scores,

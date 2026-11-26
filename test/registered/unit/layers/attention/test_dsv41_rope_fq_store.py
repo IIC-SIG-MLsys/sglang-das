@@ -2,11 +2,13 @@
 
 import ast
 import enum
+import functools
+import importlib.util
 import os
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -45,6 +47,41 @@ class MetadataOnlyHCU(torch.Tensor):
         return True
 
 
+class TestDSV41IndexerPrep(CustomTestCase):
+    def test_old_lightop_import_and_positioned_rope_fallback(self):
+        """Older Decode wheels still load the indexer and rotate the requested rows."""
+        from sglang.srt.layers.attention.dsv4 import dsv41_sparse
+
+        # Execute a fresh module with HCU detected, without changing the module
+        # already held by the model registry or other tests.
+        spec = dsv41_sparse.__spec__
+        sparse = importlib.util.module_from_spec(spec)
+        legacy = {
+            name: ModuleType(name)
+            for name in ("lightop", "lightop.attention", "sgl_kernel")
+        }
+        x = torch.ones(2, 1, 128, dtype=torch.bfloat16).as_subclass(MetadataOnlyHCU)
+        x[..., 0] = 0.3
+        freqs = torch.tensor([1, -1, 1j], dtype=torch.complex64)[:, None].repeat(1, 32)
+        positions = torch.tensor([2, 0])
+        with (
+            patch.dict(sys.modules, legacy),
+            patch("sglang.srt.utils.is_hcu", return_value=True),
+            patch.dict(os.environ, {"SGLANG_HCU_OPT_INDEXER_PREP": "1"}),
+        ):
+            spec.loader.exec_module(sparse)
+            actual = sparse._rope_fq4(x, freqs, 64, positions=positions)
+            expected = torch.ones_like(x)
+            expected[..., 0] = 0.25  # FP4 rounding with a per-32 scale of 1/4.
+            expected[0, :, 64::2] = -1  # Multiplication by i rotates (1, 1) to (-1, 1).
+            self.assertTrue(torch.equal(actual, expected))
+
+            aot = Mock(return_value=expected)
+            legacy["sgl_kernel"].rope_fp4_fake_quant = aot
+            self.assertIs(sparse._rope_fq4(x, freqs, 64, positions=positions), expected)
+            self.assertTrue(torch.equal(aot.call_args.args[1], freqs[positions]))
+
+
 class TestDSV41RopeFQStore(CustomTestCase):
     def setUp(self):
         self.latent = torch.arange(1024, dtype=torch.bfloat16).reshape(2, 512)
@@ -77,6 +114,7 @@ class TestDSV41RopeFQStore(CustomTestCase):
                                compress_kv_pool=SimpleNamespace(set_key_buffer_fused=store))
         self.pool = SimpleNamespace(
             uniform_fp8=False, _unified_kv=False, dtype=torch.float8_e4m3fn,
+            supports_fp8_rope_fq_store=True,
             compression_ratios=[1], _extra_full_read_key="old-forward",
             get_extra_key_layout=lambda layer: self.layout,
             _owns_extra_key_layer_id=lambda layer: self.owns,
@@ -114,6 +152,7 @@ class TestDSV41RopeFQStore(CustomTestCase):
     def test_unsupported_pools_and_platform_keep_old_path(self):
         for target, name, value in ((self.pool, "uniform_fp8", True),
                                     (self.pool, "_unified_kv", True),
+                                    (self.pool, "supports_fp8_rope_fq_store", False),
                                     (self.pool, "dtype", torch.bfloat16),
                                     (self.layer, "rope_head_dim", 32)):
             old = getattr(target, name)
@@ -159,6 +198,45 @@ class TestDSV41RopeFQStore(CustomTestCase):
         self.assertIs(self.writes[0][0], self.latent)
         torch.testing.assert_close(self.writes[0][1], self.freqs)
 
+    def test_old_lightop_store_preserves_rotated_and_quantized_latent(self):
+        from sglang.kernels.ops.attention.dsv4 import attn
+        from sglang.kernels.ops.attention.dsv4.torch_quant import (
+            fake_quant_compressed_kv,
+        )
+
+        latent = self.latent.as_subclass(torch.Tensor)
+        freqs = self.freqs * 1j
+        rotated = latent.clone()
+        rotated[:, -64::2] = -latent[:, -63::2]
+        rotated[:, -63::2] = latent[:, -64::2]
+        expected = fake_quant_compressed_kv(rotated)
+        cache = torch.zeros(4, 512, dtype=latent.dtype)
+
+        def store(values, out, indices):
+            out.index_copy_(0, indices, values)
+
+        with (
+            patch.dict(sys.modules, {"lightop": ModuleType("lightop")}),
+            patch.object(attn, "_is_hcu", True),
+            patch.object(attn, "is_hip_runtime", return_value=True),
+            patch.object(
+                attn, "_jit_fused_store_module", return_value=SimpleNamespace(run=store)
+            ),
+        ):
+            for table in (freqs, torch.view_as_real(freqs).flatten(-2)):
+                with self.subTest(dtype=table.dtype):
+                    cache.zero_()
+                    attn.fused_store_cache(
+                        latent,
+                        cache,
+                        self.slots,
+                        page_size=64,
+                        type="flashmla",
+                        freqs_cis=table,
+                    )
+                    self.assertTrue(torch.equal(cache[self.slots], expected))
+                    self.assertFalse(cache[::2].any())
+
     def test_precomputed_cp_norm_is_not_applied_twice(self):
         normalized = self.latent + 4
         self.layer.compressor.finish = Mock(side_effect=AssertionError("norm applied twice"))
@@ -175,7 +253,10 @@ class TestDSV41RopeFQStore(CustomTestCase):
 
 class TestDSV41CPPoolNorm(CustomTestCase):
     def test_prefill_cp_only_keeps_pairing_slots_and_normalized_values(self):
-        for case in ("enabled", "flag_off", "non_cp", "decode", "other_platform", "bf16"):
+        for case in (
+            "enabled", "old_lightop", "flag_off", "non_cp",
+            "decode", "other_platform", "bf16",
+        ):
             with self.subTest(case=case):
                 self.check_case(case)
 
@@ -214,13 +295,21 @@ class TestDSV41CPPoolNorm(CustomTestCase):
                                   _low_ratio_pair_partners=pairs, _low_ratio_write_group=write)
         layer = SimpleNamespace(layer_id=0, compress_ratio=2, compressor=SimpleNamespace(
             norm=SimpleNamespace(weight=weight, eps=eps), pool_pairs=pool))
-        namespace = dict(torch=torch, os=os, _is_hcu=case != "other_platform",
-                         get_parallel=lambda: SimpleNamespace(attn_cp_size=1 if case == "non_cp" else 8))
-        compress = load_method(ROOT / "python/sglang/srt/layers/attention/deepseek_v4_backend.py",
-                               "_low_ratio_compress_torch", namespace)
+        namespace = dict(
+            torch=torch, os=os, functools=functools, _is_hcu=case != "other_platform",
+            get_parallel=lambda: SimpleNamespace(
+                attn_cp_size=1 if case == "non_cp" else 8
+            ),
+        )
+        path = ROOT / "python/sglang/srt/layers/attention/deepseek_v4_backend.py"
+        load_method(path, "_get_cp_pool_pairs_norm", namespace)
+        compress = load_method(path, "_low_ratio_compress_torch", namespace)
+        lightop = ModuleType("lightop")
+        if case != "old_lightop":
+            lightop.dsv41_pool_pairs_norm = fused
         flag = "SGLANG_HCU_OPT_DSV41_CP_POOL_NORM"
         with patch.dict(os.environ, {flag: "0" if case == "flag_off" else "1"}), patch.dict(
-            sys.modules, {"lightop": SimpleNamespace(dsv41_pool_pairs_norm=fused)}
+            sys.modules, {"lightop": lightop}
         ):
             compress(backend, layer, None, requests, positions, projected=(current, score),
                      fuse_rope_fq_store=case != "decode")
