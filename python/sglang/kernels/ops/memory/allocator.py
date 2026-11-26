@@ -3,6 +3,55 @@ import triton
 import triton.language as tl
 
 
+@triton.jit(do_not_specialize=["num_tokens"])
+def _alloc_extend_single_request_kernel(
+    prefix_lens,
+    last_loc,
+    free_pages,
+    out,
+    num_tokens,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    prefix_len = tl.load(prefix_lens)
+    reused = (PAGE_SIZE - prefix_len % PAGE_SIZE) % PAGE_SIZE
+    is_new = offset >= reused
+    new_offset = tl.maximum(offset - reused, 0)
+    page = tl.load(
+        free_pages + new_offset // PAGE_SIZE,
+        mask=is_new & (offset < num_tokens),
+        other=0,
+    )
+    last = tl.load(last_loc, mask=reused != 0, other=-1)
+    loc = tl.where(is_new, page * PAGE_SIZE + new_offset % PAGE_SIZE, last + 1 + offset)
+    tl.store(out + offset, loc, mask=offset < num_tokens)
+
+
+def alloc_extend_single_request(
+    prefix_lens: torch.Tensor,
+    last_loc: torch.Tensor,
+    free_pages: torch.Tensor,
+    out: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Expand one request's checked free-page slice and any reused prefix tail."""
+    num_tokens = out.numel()
+    if num_tokens == 0:
+        return
+    block = 1024
+    _alloc_extend_single_request_kernel[(triton.cdiv(num_tokens, block),)](
+        prefix_lens,
+        last_loc,
+        free_pages,
+        out,
+        num_tokens,
+        page_size,
+        block,
+        num_warps=4,
+    )
+
+
 @triton.jit(do_not_specialize=["num_pages", "full_page_representatives"])
 def get_and_clear_swa_pages_kernel(
     full_page_representatives,

@@ -76,6 +76,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
     setup_state_kv_args,
+    translate_transfer_pages,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -3225,8 +3226,11 @@ class SchedulerDisaggregationPrefillMixin:
         page_size = self.token_to_kv_pool_allocator.page_size
         end = min(req.extend_end, len(req.origin_input_ids))
         raw = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :end]
-        full = self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(raw)
-        full_pages = full[::page_size] // page_size
+        full_pages = translate_transfer_pages(
+            raw,
+            page_size,
+            self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer,
+        )
         # Intermediate chunks only transfer Full pages; SWA is a final payload.
         # Each fresh snapshot covers [0, end), including any pending older chunk.
         pages = full_pages
@@ -3242,10 +3246,11 @@ class SchedulerDisaggregationPrefillMixin:
             )
             window_start = max(req.disagg_decode_prefix_len, end - window_size)
             window_start = window_start // page_size * page_size
-            swa = self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                raw[window_start:end]
+            swa_pages = translate_transfer_pages(
+                raw[window_start:end],
+                page_size,
+                self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer,
             )
-            swa_pages = swa[::page_size] // page_size
             pages = torch.cat((full_pages, swa_pages))
         host = torch.empty_like(pages, device="cpu", pin_memory=True)
         host.copy_(pages, non_blocking=True)
@@ -3475,12 +3480,15 @@ class SchedulerDisaggregationPrefillMixin:
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.kv.req_pool_idx, window_start:seq_len
                 ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                        window_kv_indices_full
+                return (
+                    translate_transfer_pages(
+                        window_kv_indices_full,
+                        page_size,
+                        self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer,
                     )
+                    .cpu()
+                    .numpy()
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
                 cached = self.cached_disagg_page_indices(req, 0, seq_len)
@@ -3626,12 +3634,15 @@ class SchedulerDisaggregationPrefillMixin:
                     req.kv.req_pool_idx, seg_start:seg_end
                 ]
                 # Unified memory requires translating virtual ids at send time.
-                kv_indices = (
-                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                        raw_kv_indices
+                page_indices = (
+                    translate_transfer_pages(
+                        raw_kv_indices,
+                        page_size,
+                        self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer,
                     )
+                    .cpu()
+                    .numpy()
                 )
-                page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             send_hidden_chunk = (
                 streaming_pd_hidden and has_current_pd_hidden and is_final_segment

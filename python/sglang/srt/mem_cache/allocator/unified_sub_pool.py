@@ -41,6 +41,11 @@ from typing import (
 import torch
 from torch.profiler import record_function
 
+from sglang.kernels.ops.memory.allocator import (
+    alloc_decode_kernel,
+    alloc_extend_kernel,
+    alloc_extend_single_request,
+)
 from sglang.kernels.ops.memory.virtual_slot import (
     alloc_bind_inplace,
     bind_inplace,
@@ -49,10 +54,7 @@ from sglang.kernels.ops.memory.virtual_slot import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.paged import (
-    alloc_decode_kernel,
-    alloc_extend_kernel,
-)
+from sglang.srt.mem_cache.allocator.paged import use_parallel_alloc_extend
 from sglang.srt.mem_cache.unified_memory_pool import (
     UnifiedKVPool,
     UnifiedMHATokenToKVPool,
@@ -1200,15 +1202,24 @@ class MultiEndedAllocator(BaseTokenToKVPoolAllocator):
             # `free_virtual_ids` passed as `free_page_ptr`: the kernel does
             # `page_id * page_size + offset` regardless of virtual vs physical.
             with record_function("MultiEndedAlloc.alloc_extend.kernel"):
-                alloc_extend_kernel[(bs,)](
-                    prefix_lens,
-                    seq_lens,
-                    last_loc,
-                    self.free_virtual_ids,
-                    out_indices,
-                    next_power_of_2(bs),
-                    self.page_size,
-                )
+                if use_parallel_alloc_extend(prefix_lens, extend_num_tokens):
+                    alloc_extend_single_request(
+                        prefix_lens,
+                        last_loc,
+                        self.free_virtual_ids,
+                        out_indices,
+                        self.page_size,
+                    )
+                else:
+                    alloc_extend_kernel[(bs,)](
+                        prefix_lens,
+                        seq_lens,
+                        last_loc,
+                        self.free_virtual_ids,
+                        out_indices,
+                        next_power_of_2(bs),
+                        self.page_size,
+                    )
 
             # Bind the consumed virtual pages to fresh physical pages here. The
             # peer (swa side) binds the same pages via `alloc_with_virtual`.

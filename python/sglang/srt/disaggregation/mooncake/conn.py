@@ -1319,18 +1319,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V.
         """
-        # Host and device buffers may use different destination page spaces.
-        # Build both transfer plans once, then select per destination buffer.
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_data_indices, dst_data_indices
-        )
-        device_prefill_kv_blocks = device_dst_kv_blocks = None
-        if dst_device_data_indices is not None:
-            device_prefill_kv_blocks, device_dst_kv_blocks = (
-                group_concurrent_contiguous(
-                    prefill_data_indices, dst_device_data_indices
+        # Validate lengths before any bounded batch can write to a peer.
+        for dst_indices in (dst_data_indices, dst_device_data_indices):
+            if (
+                dst_indices is not None
+                and prefill_data_indices.size
+                and dst_indices.size
+                and prefill_data_indices.size != dst_indices.size
+            ):
+                raise ValueError(
+                    "group_concurrent_contiguous requires equal-length src/dst index arrays, "
+                    f"got {prefill_data_indices.size} and {dst_indices.size}"
                 )
-            )
 
         layers_params = None
 
@@ -1460,114 +1460,94 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ]
         assert layers_params is not None
 
-        def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, item_len: int
-        ) -> List[Tuple[int, int, int]]:
-            transfer_blocks = []
+        def page_runs(src, dst):
+            if src.size == 0 or dst.size == 0:
+                return None
+            # Keep only each run's first page and length. No page-by-page
+            # Python lists are needed, even when all the pages are fragmented.
+            breaks = np.flatnonzero((np.diff(src) != 1) | (np.diff(dst) != 1)) + 1
+            if breaks.size == 0:
+                return src[:1], dst[:1], np.array([src.size], dtype=np.intp)
+            starts = np.concatenate(([0], breaks))
+            return (
+                src[starts].astype(np.int64, copy=False),
+                dst[starts].astype(np.int64, copy=False),
+                np.diff(starts, append=src.size),
+            )
+
+        def plans_for_slice(page_slice):
+            src = prefill_data_indices[page_slice]
+            host = page_runs(src, dst_data_indices[page_slice])
+            device = (
+                page_runs(src, dst_device_data_indices[page_slice])
+                if dst_device_data_indices is not None
+                else None
+            )
+            return host, device
+
+        def transfer_blocks(src_ptr, dst_ptr, item_len, plans):
+            host, device = plans
             if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
-                assert (
-                    device_prefill_kv_blocks is not None
-                    and device_dst_kv_blocks is not None
-                )
-                src_blocks, dst_blocks = (
-                    device_prefill_kv_blocks,
-                    device_dst_kv_blocks,
-                )
+                assert dst_device_data_indices is not None
+                runs = device
             else:
-                src_blocks, dst_blocks = prefill_kv_blocks, dst_kv_blocks
-            for prefill_index, decode_index in zip(src_blocks, dst_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-            return transfer_blocks
+                runs = host
+            if runs is None:
+                return []
+            src, dst, lengths = runs
+            if lengths.size == 1:
+                return [
+                    (
+                        src_ptr + int(src[0]) * item_len,
+                        dst_ptr + int(dst[0]) * item_len,
+                        int(lengths[0]) * item_len,
+                    )
+                ]
+            src_addrs = np.uint64(src_ptr) + (src * item_len).astype(np.uint64)
+            dst_addrs = np.uint64(dst_ptr) + (dst * item_len).astype(np.uint64)
+            return zip(
+                src_addrs.tolist(), dst_addrs.tolist(), (lengths * item_len).tolist()
+            )
 
         # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+        def process_layer(src_ptr, dst_ptr, item_len, plans) -> int:
+            blocks = list(transfer_blocks(src_ptr, dst_ptr, item_len, plans))
+            return self._transfer_data(mooncake_session_id, blocks)
 
         # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
-            transfer_blocks = []
+        def process_layers(plans) -> int:
+            blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
-            return self._transfer_data(mooncake_session_id, transfer_blocks)
+                blocks.extend(transfer_blocks(src_ptr, dst_ptr, item_len, plans))
+            return self._transfer_data(mooncake_session_id, blocks)
 
         if (
             self.enable_custom_mem_pool
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
+            plans = plans_for_slice(slice(None))
             futures = [
                 executor.submit(
                     process_layer,
                     src_ptr,
                     dst_ptr,
                     item_len,
+                    plans,
                 )
                 for (src_ptr, dst_ptr, item_len) in layers_params
             ]
             return self._await_transfer_futures(futures)
-        else:
-            # Combining all layers' params in one batch transfer is more efficient
-            # compared to using multiple threads. Preserve this legacy path unless
-            # users explicitly opt in to bounded index batches.
-            max_batch_indices = self.max_transfer_batch_indices
-            if max_batch_indices <= 0 or prefill_data_indices.size <= max_batch_indices:
-                return process_layers(layers_params)
-
-            def process_index_batch(
-                prefill_blocks,
-                dst_blocks,
-                device_prefill_blocks=None,
-                device_dst_blocks=None,
-            ) -> int:
-                transfer_blocks = []
-                for src_ptr, dst_ptr, item_len in layers_params:
-                    if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
-                        assert (
-                            device_prefill_blocks is not None
-                            and device_dst_blocks is not None
-                        )
-                        src_blocks, target_blocks = (
-                            device_prefill_blocks,
-                            device_dst_blocks,
-                        )
-                    else:
-                        src_blocks, target_blocks = prefill_blocks, dst_blocks
-                    for prefill_index, decode_index in zip(src_blocks, target_blocks):
-                        src_addr = src_ptr + int(prefill_index[0]) * item_len
-                        dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                        length = item_len * len(prefill_index)
-                        transfer_blocks.append((src_addr, dst_addr, length))
-                return self._transfer_data(mooncake_session_id, transfer_blocks)
-
-            for start in range(
-                0,
-                prefill_data_indices.size,
-                max_batch_indices,
-            ):
-                batch_prefill_blocks, batch_dst_blocks = group_concurrent_contiguous(
-                    prefill_data_indices[start : start + max_batch_indices],
-                    dst_data_indices[start : start + max_batch_indices],
-                )
-                batch_device_prefill_blocks = batch_device_dst_blocks = None
-                if dst_device_data_indices is not None:
-                    batch_device_prefill_blocks, batch_device_dst_blocks = (
-                        group_concurrent_contiguous(
-                            prefill_data_indices[start : start + max_batch_indices],
-                            dst_device_data_indices[start : start + max_batch_indices],
-                        )
-                    )
-                ret = process_index_batch(
-                    batch_prefill_blocks,
-                    batch_dst_blocks,
-                    batch_device_prefill_blocks,
-                    batch_device_dst_blocks,
-                )
-                if ret != 0:
-                    return ret
-            return 0
+        # Combine layers into one transfer unless bounded index batches are enabled.
+        max_batch_indices = self.max_transfer_batch_indices
+        if max_batch_indices <= 0 or prefill_data_indices.size <= max_batch_indices:
+            return process_layers(plans_for_slice(slice(None)))
+        for start in range(0, prefill_data_indices.size, max_batch_indices):
+            ret = process_layers(
+                plans_for_slice(slice(start, start + max_batch_indices))
+            )
+            if ret != 0:
+                return ret
+        return 0
 
     def _validate_envelope_kv_layout(
         self,
