@@ -374,6 +374,17 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.compact_fp4_candidate_logits",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.attention.dsv4.compact_fp4_candidate_logits:"
+            "compact_fp4_candidate_logits"
+        ),
+        capabilities=frozenset({CapabilityRequirement.HIP}),  # gfx936 at entry
+    )
+)
 
 register_kernel(
     KernelSpec(

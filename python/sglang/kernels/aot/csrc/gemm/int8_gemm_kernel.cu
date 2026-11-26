@@ -18,7 +18,7 @@ limitations under the License.
 #include <torch/library.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/hip/HIPStream.h>
-#include <hipblaslt/hipblaslt.h>
+#include "int8_gemm_hipblaslt.h"
 #include <map>
 #include <memory>
 #include <tuple>
@@ -36,6 +36,7 @@ limitations under the License.
 #include <vector>
 #include <string>
 #include <cstring>
+#include <utility>
 
 // Keep the validated HIP scale arithmetic precise without changing flags for other kernels.
 #if defined(__clang__)
@@ -43,45 +44,8 @@ limitations under the License.
 #pragma clang fp reassociate(off)
 #endif
 
-namespace dsv41_lt {
-struct LtHandle {
-  hipblasLtHandle_t value = nullptr;
-  LtHandle() = default;
-  LtHandle(const LtHandle&) = delete;
-  LtHandle& operator=(const LtHandle&) = delete;
-  ~LtHandle() { if (value) hipblasLtDestroy(value); }
-};
-struct MatmulDesc {
-  hipblasLtMatmulDesc_t value = nullptr;
-  MatmulDesc() = default;
-  MatmulDesc(const MatmulDesc&) = delete;
-  MatmulDesc& operator=(const MatmulDesc&) = delete;
-  ~MatmulDesc() { if (value) hipblasLtMatmulDescDestroy(value); }
-};
-struct MatrixLayout {
-  hipblasLtMatrixLayout_t value = nullptr;
-  MatrixLayout() = default;
-  MatrixLayout(const MatrixLayout&) = delete;
-  MatrixLayout& operator=(const MatrixLayout&) = delete;
-  ~MatrixLayout() { if (value) hipblasLtMatrixLayoutDestroy(value); }
-};
-struct MatmulPreference {
-  hipblasLtMatmulPreference_t value = nullptr;
-  MatmulPreference() = default;
-  MatmulPreference(const MatmulPreference&) = delete;
-  MatmulPreference& operator=(const MatmulPreference&) = delete;
-  ~MatmulPreference() { if (value) hipblasLtMatmulPreferenceDestroy(value); }
-};
-}  // namespace dsv41_lt
-
 namespace dsv41_unpacked {
-// SPDX-License-Identifier: Apache-2.0
-// Only the three DSV4.1 channelwise INT8 projections use this bridge.
 namespace {
-void check(hipblasStatus_t s, const char* op) {
-  TORCH_CHECK(s == HIPBLAS_STATUS_SUCCESS, "DSV41 INT8 hipBLASLt ", op,
-              " failed, status=", static_cast<int>(s));
-}
 void require_warmup(hipStream_t stream) {
   hipStreamCaptureStatus state;
   TORCH_CHECK(hipStreamIsCapturing(stream, &state) == hipSuccess,
@@ -89,104 +53,148 @@ void require_warmup(hipStream_t stream) {
   TORCH_CHECK(state == hipStreamCaptureStatusNone,
               "Warm up the DSV41 hipBLASLt INT8 shape before graph capture");
 }
-struct Handle {
-  hipblasLtHandle_t value = nullptr;
-  Handle() { check(hipblasLtCreate(&value), "create"); }
-  ~Handle() { if(value) hipblasLtDestroy(value); }
-};
+
 hipblasLtHandle_t handle_for(int device, hipStream_t stream) {
-  thread_local std::map<int, std::unique_ptr<Handle>> handles;
+  thread_local std::map<int, std::unique_ptr<dsv41_lt::LtHandle>> handles;
   auto it = handles.find(device);
-  if(it == handles.end()) {
+  if (it == handles.end()) {
     require_warmup(stream);
-    it = handles.emplace(device, std::make_unique<Handle>()).first;
+    auto handle = std::make_unique<dsv41_lt::LtHandle>();
+    dsv41_lt::check(hipblasLtCreate(&handle->value), "create");
+    it = handles.emplace(device, std::move(handle)).first;
   }
   return it->second->value;
 }
-struct Plan {
-  dsv41_lt::MatmulDesc desc;
-  dsv41_lt::MatrixLayout a, b, c, d;
-  hipblasLtMatmulAlgo_t algo{};
-  Plan(hipblasLtHandle_t h, int64_t m,int64_t n,int64_t cols,int64_t k,
-       int64_t g,bool group_major,int64_t algo_rank) {
-    check(hipblasLtMatmulDescCreate(&desc.value,HIPBLAS_COMPUTE_32I,HIP_R_32I),"descriptor");
-    hipblasOperation_t ta=HIPBLAS_OP_T,tb=HIPBLAS_OP_N;
-    check(hipblasLtMatmulDescSetAttribute(desc.value,HIPBLASLT_MATMUL_DESC_TRANSA,&ta,sizeof(ta)),"transA");
-    check(hipblasLtMatmulDescSetAttribute(desc.value,HIPBLASLT_MATMUL_DESC_TRANSB,&tb,sizeof(tb)),"transB");
-    const int64_t ldx=group_major?k:g*k, ldy=group_major?n:g*n;
-    check(hipblasLtMatrixLayoutCreate(&a.value,HIP_R_8I,k,cols,k),"A layout");
-    check(hipblasLtMatrixLayoutCreate(&b.value,HIP_R_8I,k,m,ldx),"B layout");
-    check(hipblasLtMatrixLayoutCreate(&c.value,HIP_R_32I,cols,m,ldy),"C layout");
-    check(hipblasLtMatrixLayoutCreate(&d.value,HIP_R_32I,cols,m,ldy),"D layout");
-    if(g>1) {
-      int32_t count=static_cast<int32_t>(g);
-      int64_t strides[4]={n*k,group_major?m*k:k,group_major?m*n:n,group_major?m*n:n};
-      hipblasLtMatrixLayout_t layouts[4]={a.value,b.value,c.value,d.value};
-      for(int i=0;i<4;i++) {
-        check(hipblasLtMatrixLayoutSetAttribute(layouts[i],HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT,&count,sizeof(count)),"batch count");
-        check(hipblasLtMatrixLayoutSetAttribute(layouts[i],HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET,&strides[i],sizeof(int64_t)),"batch stride");
-      }
-    }
-    dsv41_lt::MatmulPreference pref;
-    check(hipblasLtMatmulPreferenceCreate(&pref.value),"preference");
-    uint64_t workspace=0;
-    check(hipblasLtMatmulPreferenceSetAttribute(pref.value,HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,&workspace,sizeof(workspace)),"workspace");
-    hipblasLtMatmulHeuristicResult_t results[64]{};
-    int count=0;
-    const auto status=hipblasLtMatmulAlgoGetHeuristic(h,desc.value,a.value,b.value,c.value,d.value,pref.value,64,results,&count);
-    TORCH_CHECK(status==HIPBLAS_STATUS_SUCCESS && count>algo_rank && results[algo_rank].state==HIPBLAS_STATUS_SUCCESS && results[algo_rank].workspaceSize==0,
-      "No zero-workspace hipBLASLt INT8->INT32 algorithm: M=",m,", N=",cols,", K=",k,", G=",g,
-      ", group_major=",group_major,", status=",static_cast<int>(status),", count=",count,
-      ". Forced BLASLt mode never falls back to another GEMM.");
-    algo=results[algo_rank].algo;
-    const char* log=std::getenv("SGLANG_DSV41_INT8_BLASLT_LOG");
-    if(log && log[0]=='1') std::cerr<<"[DSV41_BLASLT_INT8] M="<<m<<" N="<<cols<<" K="<<k<<" G="<<g
-      <<" group_major="<<group_major<<" algo_rank="<<algo_rank<<" A/B=INT8 C/D=INT32 compute=INT32 workspace=0\n";
-  }
-};
-Plan& plan_for(int device,hipblasLtHandle_t h,hipStream_t stream,int64_t m,int64_t n,
-               int64_t cols,int64_t k,int64_t g,bool group_major,int64_t algo_rank) {
-  using Key=std::tuple<int,int64_t,int64_t,int64_t,int64_t,int64_t,bool,int64_t>;
-  thread_local std::map<Key,std::unique_ptr<Plan>> plans;
-  const Key key{device,m,n,cols,k,g,group_major,algo_rank};
-  auto it=plans.find(key);
-  if(it==plans.end()) {
+
+const dsv41_lt::UnpackedGemm& plan_for(
+    int device,
+    hipblasLtHandle_t handle,
+    hipStream_t stream,
+    int64_t m,
+    int64_t n,
+    int64_t cols,
+    int64_t k,
+    int64_t groups,
+    bool group_major,
+    int64_t workspace_limit,
+    int64_t algo_rank) {
+  using Key = std::tuple<int, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t>;
+  thread_local std::map<Key, std::unique_ptr<dsv41_lt::UnpackedGemm>> plans;
+  const Key key{device, m, n, cols, k, groups, group_major, workspace_limit};
+  auto it = plans.find(key);
+  if (it == plans.end()) {
     require_warmup(stream);
-    it=plans.emplace(key,std::make_unique<Plan>(h,m,n,cols,k,g,group_major,algo_rank)).first;
+    auto plan = std::make_unique<dsv41_lt::UnpackedGemm>(handle, m, n, cols, k, groups, group_major, workspace_limit);
+    const char* log = std::getenv("SGLANG_DSV41_INT8_BLASLT_LOG");
+    if (log && log[0] == '1') {
+      std::cerr << "[DSV41_BLASLT_INT8] M=" << m << " N=" << cols << " K=" << k << " G=" << groups
+                << " group_major=" << group_major << " algo_rank=" << algo_rank
+                << " workspace=" << plan->workspace_bytes(algo_rank) << '\n';
+    }
+    it = plans.emplace(key, std::move(plan)).first;
   }
   return *it->second;
 }
-void gemm_out(const at::Tensor& q,const at::Tensor& w,at::Tensor out,
-              int64_t groups,int64_t tile_n,bool group_major,int64_t algo_rank) {
-  TORCH_CHECK(q.is_cuda()&&w.is_cuda()&&out.is_cuda()&&q.device()==w.device()&&q.device()==out.device(),"HCU tensors must share a device");
-  TORCH_CHECK(q.scalar_type()==at::kChar&&w.scalar_type()==at::kChar&&out.scalar_type()==at::kInt,"Need INT8 A/B and INT32 output");
-  TORCH_CHECK(q.dim()==3&&w.dim()==2&&out.dim()==3&&q.is_contiguous()&&w.is_contiguous()&&out.is_contiguous(),"Need contiguous activation/output and row-major weights");
-  TORCH_CHECK(groups>0&&tile_n>=0&&algo_rank>=0&&algo_rank<64,"Invalid grouping/tile");
-  const auto m=q.size(group_major?1:0),k=q.size(2);
-  TORCH_CHECK(q.size(group_major?0:1)==groups&&w.size(1)==k&&w.size(0)%groups==0,"Invalid grouped input dimensions");
-  const auto n=w.size(0)/groups;
-  TORCH_CHECK(out.size(group_major?0:1)==groups&&out.size(group_major?1:0)==m&&out.size(2)==n,"Invalid output shape");
-  TORCH_CHECK(k>0&&n>0&&k%4==0&&m<=INT_MAX&&n<=INT_MAX&&k<=INT_MAX&&groups<=INT_MAX,"Unsupported INT8 matrix dimensions");
-  TORCH_CHECK(groups==1||tile_n==0,"Output-channel tiling is only for dense projections");
-  if(m==0)return;
+
+void gemm_tuned_out(
+    const at::Tensor& q,
+    const at::Tensor& w,
+    at::Tensor out,
+    int64_t groups,
+    int64_t tile_n,
+    bool group_major,
+    int64_t algo_rank,
+    int64_t workspace_limit) {
+  TORCH_CHECK(
+      q.is_cuda() && w.is_cuda() && out.is_cuda() && q.device() == w.device() && q.device() == out.device(),
+      "HCU tensors must share a device");
+  TORCH_CHECK(
+      q.scalar_type() == at::kChar && w.scalar_type() == at::kChar && out.scalar_type() == at::kInt,
+      "Need INT8 A/B and INT32 output");
+  TORCH_CHECK(
+      q.dim() == 3 && w.dim() == 2 && out.dim() == 3 && q.is_contiguous() && w.is_contiguous() && out.is_contiguous(),
+      "Need contiguous activations, weights and output");
+  TORCH_CHECK(
+      groups > 0 && (groups == 1 || !tile_n) && tile_n >= 0 && algo_rank >= 0 &&
+          algo_rank < dsv41_lt::kHeuristicCount && workspace_limit >= 0 && workspace_limit <= UINT32_MAX,
+      "Invalid INT8 grouping, tile, rank or workspace limit");
+
+  const auto m = q.size(group_major ? 1 : 0);
+  const auto k = q.size(2);
+  TORCH_CHECK(
+      q.size(group_major ? 0 : 1) == groups && w.size(1) == k && w.size(0) % groups == 0,
+      "Invalid grouped input dimensions");
+  const auto n = w.size(0) / groups;
+  TORCH_CHECK(
+      out.size(group_major ? 0 : 1) == groups && out.size(group_major ? 1 : 0) == m && out.size(2) == n,
+      "Invalid output shape");
+  TORCH_CHECK(
+      k > 0 && n > 0 && k % 4 == 0 && m <= INT_MAX && n <= INT_MAX && k <= INT_MAX && groups <= INT_MAX,
+      "Unsupported INT8 matrix dimensions");
+  if (m == 0) return;
+
   c10::DeviceGuard guard(q.device());
-  auto stream=c10::hip::getCurrentHIPStream(q.get_device()).stream();
-  auto h=handle_for(q.get_device(),stream);
-  const int32_t alpha=1,beta=0;
-  const auto* xp=q.data_ptr<int8_t>();const auto* wp=w.data_ptr<int8_t>();
-  auto* yp=out.data_ptr<int32_t>();
-  const int64_t step=tile_n?tile_n:n;
-  for(int64_t start=0;start<n;start+=step) {
-    const auto cols=std::min(step,n-start);
-    auto& p=plan_for(q.get_device(),h,stream,m,n,cols,k,groups,group_major,algo_rank);
-    check(hipblasLtMatmul(h,p.desc.value,&alpha,wp+start*k,p.a.value,xp,p.b.value,&beta,yp+start,p.c.value,
-                         yp+start,p.d.value,&p.algo,nullptr,0,stream),"matmul");
+  const auto stream = c10::hip::getCurrentHIPStream(q.get_device()).stream();
+  const auto handle = handle_for(q.get_device(), stream);
+  const auto* xp = q.data_ptr<int8_t>();
+  const auto* wp = w.data_ptr<int8_t>();
+  auto* yp = out.data_ptr<int32_t>();
+  const int64_t step = tile_n ? tile_n : n;
+  at::Tensor workspace;
+  int64_t allocated = 0;
+  for (int64_t start = 0; start < n; start += step) {
+    const auto cols = std::min(step, n - start);
+    const auto& plan =
+        plan_for(q.get_device(), handle, stream, m, n, cols, k, groups, group_major, workspace_limit, algo_rank);
+    const auto required = plan.workspace_bytes(algo_rank);
+    TORCH_CHECK(
+        required >= 0,
+        "No compatible hipBLASLt INT8 algorithm: M=",
+        m,
+        ", N=",
+        cols,
+        ", K=",
+        k,
+        ", G=",
+        groups,
+        ", rank=",
+        algo_rank,
+        ", count=",
+        plan.count(),
+        ", workspace limit=",
+        workspace_limit);
+    if (allocated < required) {
+      // The tensor allocator owns scratch on the launch stream, including
+      // graph-private allocations. Plans never retain workspace or pointers.
+      workspace = at::empty({required}, q.options().dtype(at::kByte));
+      allocated = required;
+    }
+    dsv41_lt::check(
+        plan.run(
+            handle,
+            algo_rank,
+            xp,
+            wp + start * k,
+            yp + start,
+            required ? workspace.data_ptr() : nullptr,
+            required,
+            stream),
+        "matmul");
   }
 }
-}
 
+void gemm_out(
+    const at::Tensor& q,
+    const at::Tensor& w,
+    at::Tensor out,
+    int64_t groups,
+    int64_t tile_n,
+    bool group_major,
+    int64_t algo_rank) {
+  gemm_tuned_out(q, w, out, groups, tile_n, group_major, algo_rank, 0);
 }
-
+}  // namespace
+}  // namespace dsv41_unpacked
 
 namespace dsv41_quant {
 // SPDX-License-Identifier: Apache-2.0
@@ -494,8 +502,14 @@ void scale_scheduled(const at::Tensor&raw,const at::Tensor&xs,const at::Tensor&w
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel,m) {
   m.def("dsv41_int8_gemm_out(Tensor q, Tensor w, Tensor(a!) out, int groups, int tile_n, bool group_major, int algo_rank=0) -> ()");
+  m.def(
+      "dsv41_int8_gemm_tuned_out(Tensor q, Tensor w, Tensor(a!) out, int groups, int tile_n, bool group_major, int "
+      "algo_rank, int workspace_limit) -> ()");
 }
-TORCH_LIBRARY_IMPL(sgl_kernel,CUDA,m) {m.impl("dsv41_int8_gemm_out",dsv41_unpacked::gemm_out);}
+TORCH_LIBRARY_IMPL(sgl_kernel, CUDA, m) {
+  m.impl("dsv41_int8_gemm_out", dsv41_unpacked::gemm_out);
+  m.impl("dsv41_int8_gemm_tuned_out", dsv41_unpacked::gemm_tuned_out);
+}
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel,m) {
   m.def("dsv41_int8_quantize_out(Tensor x, Tensor(a!) q, Tensor(b!) scales) -> ()");

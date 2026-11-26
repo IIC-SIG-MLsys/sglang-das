@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     free_swa_out_of_window_slots,
+    page_align_floor,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -1313,25 +1314,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 ):
                     self.release_swa_prefix_lock(req)
                 if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
-                    # Reclaim private SWA past the active window using the actual
-                    # forward token position (never truncated by an unconsumed
-                    # swa_branching_seqlen or EAGLE bigram subtraction) and
-                    # without prefix-sharing page padding since this checkpoint
-                    # does not insert into the tree. FULL pages stay owned by
-                    # req until async PD transfer drains.
+                    # Intermediate PD sends own FULL pages. Paged SWA ships only
+                    # with the final send, after this checkpoint.
                     forward_len = len(token_ids)
-                    free_swa_out_of_window_slots(
-                        req,
-                        forward_len,
-                        sliding_window_size=swa.sliding_window_size,
-                        page_size=self.page_size,
-                        req_to_token_pool=self.req_to_token_pool,
-                        token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                        supports_prefix_sharing=False,
-                    )
-                    insert_params.set_evicted_seqlen(
-                        ComponentType.SWA,
-                        req.kv.get_evicted_seqlen(ComponentType.SWA),
+                    self._free_unpublished_prefill_swa(
+                        req, forward_len, swa.sliding_window_size, insert_params
                     )
                     for comp in self._components_tuple:
                         if comp.component_type != ComponentType.SWA:
@@ -1571,18 +1558,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 and getattr(self, "decoder_swa_bounded_replay", False)
                 and getattr(swa, "gates_prefix_match", True)
             ):
-                free_swa_out_of_window_slots(
-                    req,
-                    len(token_ids),
-                    sliding_window_size=swa.sliding_window_size,
-                    page_size=self.page_size,
-                    req_to_token_pool=self.req_to_token_pool,
-                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    supports_prefix_sharing=False,
-                )
-                insert_params.set_evicted_seqlen(
-                    ComponentType.SWA,
-                    req.kv.get_evicted_seqlen(ComponentType.SWA),
+                self._free_unpublished_prefill_swa(
+                    req, len(token_ids), swa.sliding_window_size, insert_params
                 )
                 for comp in self._components_tuple:
                     if comp.component_type != ComponentType.SWA:
@@ -1599,6 +1576,57 @@ class UnifiedRadixCache(BasePrefixCache):
             comp.cleanup_after_caching_req(
                 req, is_finished=False, insert_params=insert_params
             )
+
+    def _free_unpublished_prefill_swa(
+        self, req: Req, forward_len: int, window: int, insert_params: InsertParams
+    ) -> None:
+        retain_floor = None
+        allocator = self.token_to_kv_pool_allocator
+        if self.supports_prefix_sharing() and not req.skip_radix_cache_insert:
+            page_size = self.page_size
+            origin_ids = getattr(req, "origin_input_ids", None)
+            fill_ids = getattr(req, "full_untruncated_fill_ids", None)
+            prompt_len = max(
+                forward_len,
+                len(origin_ids) if origin_ids is not None else 0,
+                len(fill_ids) if fill_ids is not None else 0,
+            )
+            # A prompt up to one page shorter than the producer can match at
+            # floor(prompt_len - page_size - window), one atom less for bigrams.
+            # Keep a full window *before* that boundary for the radix validator.
+            earliest_match_end = page_align_floor(
+                prompt_len - page_size - window - int(self.tree_core.is_eagle),
+                page_size,
+            )
+            retain_floor = max(0, earliest_match_end - ceil_align(window, page_size))
+            size_swa = getattr(allocator, "size_swa", None)
+            # PD prefill allocates more local KV only while prompt tokens remain.
+            if (
+                forward_len < prompt_len
+                and isinstance(size_swa, int)
+                and not isinstance(size_swa, bool)
+                and size_swa > 0
+            ):
+                # Leave room for the rest of the prompt's tail and the scheduler's
+                # alignment reserve. Tiny SWA pools may sacrifice some history.
+                retain_floor = max(
+                    retain_floor,
+                    ceil_align(prompt_len, page_size) + page_size - size_swa,
+                )
+
+        free_swa_out_of_window_slots(
+            req,
+            forward_len,
+            sliding_window_size=window,
+            page_size=self.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=allocator,
+            supports_prefix_sharing=False,
+            retain_floor=retain_floor,
+        )
+        insert_params.set_evicted_seqlen(
+            ComponentType.SWA, req.kv.get_evicted_seqlen(ComponentType.SWA)
+        )
 
     # ---- Internal Helpers ----
 

@@ -4,7 +4,7 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -14,6 +14,7 @@ from http import HTTPStatus
 from typing import Optional
 from unittest.mock import AsyncMock, Mock
 
+import orjson
 from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
@@ -63,7 +64,7 @@ class _MockTemplateManager:
         self.jinja_template_may_reorder_tool_results = False
 
 
-class ServingCompletionTestCase(unittest.TestCase):
+class ServingCompletionTestCase(CustomTestCase):
     """Bundle all prompt/echo tests in one TestCase."""
 
     # ---------- shared test fixtures ----------
@@ -413,6 +414,34 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(len(response.choices), 1)
         self.assertEqual(response.choices[0].logprobs.token_logprobs, [-0.1])
         self.assertEqual(response.choices[0].logprobs.top_logprobs, [])
+
+    def test_streaming_text_does_not_match_done_sentinel(self):
+        """A legacy PD router must see the terminal marker only at the end."""
+        text = '"\\data: [DONE]" data\\u003a [DONE]'
+        request = CompletionRequest(model="x", prompt="prompt", stream=True)
+        adapted_request, _ = self.sc._convert_to_internal_request(request)
+
+        async def generate_request(*args, **kwargs):
+            yield {"text": text, "meta_info": {"id": "cmpl-done-sentinel"}}
+
+        self.sc.tokenizer_manager.generate_request = generate_request
+
+        async def run_stream():
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, request, self.fastapi_request
+                )
+            ]
+
+        frame, terminal = get_or_create_event_loop().run_until_complete(run_stream())
+        self.assertEqual(terminal, "data: [DONE]\n\n")
+        self.assertTrue(frame.startswith("data: "))
+        self.assertNotIn("data: [DONE]", frame)
+        for loads in (json.loads, orjson.loads):
+            self.assertEqual(
+                loads(frame.removeprefix("data: "))["choices"][0]["text"], text
+            )
 
     def test_streaming_token_ids_deltas_cover_output_exactly(self):
         req = CompletionRequest(

@@ -1,5 +1,7 @@
 """DeepSeek V4.1 wrappers around the LayerSplit pool API."""
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
     CpCacheLayerSplitDeepSeekV4TokenToKVPool,
@@ -9,6 +11,41 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 
 def is_cp_cache_layer_split_deepseek_v4_pool(pool) -> bool:
     return isinstance(pool, CpCacheLayerSplitDeepSeekV4TokenToKVPool)
+
+
+def can_optimize_hcu_cp_gather(pool, forward_batch, local_rows: int) -> bool:
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
+    )
+    from sglang.srt.layers.utils.hcu_cp_utils import ContextParallelMetadata
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    # All CP ranks derive eligibility from the same request lengths and the
+    # equal physical shard size. Padded, indexed, and replay rows keep the
+    # original path, which owns their distinct ordering and write masks.
+    metadata = forward_batch.attn_cp_metadata
+    if not (
+        is_cp_cache_layer_split_deepseek_v4_pool(pool)
+        and forward_batch.forward_mode == ForwardMode.EXTEND
+        and isinstance(metadata, ContextParallelMetadata)
+        and getattr(metadata, "gather_index", None) is None
+        and is_dsa_prefill_cp_round_robin_split()
+        and not forward_batch.encoder_swa_replay
+        and forward_batch.extend_seq_lens_cpu is not None
+        and local_rows > 0
+        and local_rows * pool.cp_size == sum(forward_batch.extend_seq_lens_cpu)
+        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+    ):
+        return False
+
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+
+    return (
+        not is_batch_invariant_mode_enabled()
+        and not get_is_capture_mode()
+        and not torch.cuda.is_current_stream_capturing()
+    )
 
 
 def _should_sync_cp_cache_layer_split(pool, forward_batch) -> bool:

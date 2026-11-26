@@ -2,9 +2,12 @@
 contract that replaced the raw_json passthrough, checked without a server, and
 where the route applies it."""
 
+import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import orjson
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
@@ -100,6 +103,36 @@ class TestGenerateContract(CustomTestCase):
 
 
 class TestGenerateRouteGate(CustomTestCase):
+    def test_streaming_text_does_not_match_done_sentinel(self):
+        """A legacy PD router must see its end marker only in the terminal frame."""
+        output = {
+            "text": '"\\data: [DONE]"\n雪 data: [DONE] data\\u003a [DONE]',
+            "meta_info": {"data: [DONE]": "metadata"},
+        }
+
+        async def generate_request(obj, request):
+            yield output
+
+        manager = SimpleNamespace(
+            generate_request=generate_request, create_abort_task=lambda obj: None
+        )
+        app = FastAPI()
+        app.add_api_route("/generate", http_server.generate_request, methods=["POST"])
+        with patch.object(
+            http_server, "_global_state", SimpleNamespace(tokenizer_manager=manager)
+        ):
+            response = TestClient(app).post(
+                "/generate", json={"text": "prompt", "stream": True}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        frame, terminal = response.content.split(b"\n\n", 1)
+        self.assertEqual(terminal, b"data: [DONE]\n\n")
+        self.assertTrue(frame.startswith(b"data: "))
+        self.assertNotIn(b"data: [DONE]", frame)
+        for loads in (json.loads, orjson.loads):
+            self.assertEqual(loads(frame.removeprefix(b"data: ")), output)
+
     def test_route_checks_the_contract_and_serve_does_not(self):
         """`/generate` refuses a contract violation before serving it;
         `serve_generate_request`, which routes with their own parser call,

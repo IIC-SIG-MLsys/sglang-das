@@ -1,20 +1,24 @@
 """Single DSV4.1 INT8 projection entry point for the AOT hipBLASLt backend.
 
-The existing HIP and private Triton computations are unchanged. Native operators
-are provided by the matching sglang-kernel common_ops build, not a JIT extension.
+Native operators are provided by the matching sglang-kernel common_ops build.
 """
+
 import json
+import logging
 import os
 import threading
 import weakref
 from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
+
+logger = logging.getLogger(__name__)
 
 _OPERATORS = (
     "dsv41_int8_quantize_out",
@@ -39,6 +43,32 @@ class _NativeOps:
             q, weight, out, groups, tile_n, group_major, algo_rank
         )
 
+    def gemm_tuned_out(
+        self,
+        q,
+        weight,
+        out,
+        groups,
+        tile_n,
+        group_major,
+        algo_rank,
+        workspace_bytes,
+    ):
+        op = getattr(self._ops, "dsv41_int8_gemm_tuned_out", None)
+        if op is None:
+            raise RuntimeError(
+                "The installed kernel wheel lacks dsv41_int8_gemm_tuned_out"
+            )
+        return op(
+            q,
+            weight,
+            out,
+            groups,
+            tile_n,
+            group_major,
+            algo_rank,
+            workspace_bytes,
+        )
 
     def scale_out(self, raw, x_scale, weight_scale, out, groups, group_major):
         return self._ops.dsv41_int8_scale_out(
@@ -71,9 +101,11 @@ class _NativeOps:
 @lru_cache(maxsize=1)
 def backend():
     try:
-        import sgl_kernel  # Loads the installed common_ops registration.
+        import sgl_kernel  # noqa: F401 -- loads the common_ops registration.
     except ImportError as exc:
-        raise RuntimeError("Rebuild the matching HCU sglang-kernel wheel with DSV4.1 INT8 support.") from exc
+        raise RuntimeError(
+            "Rebuild the matching HCU sglang-kernel wheel with DSV4.1 INT8 support."
+        ) from exc
     ops = torch.ops.sgl_kernel
     missing = [name for name in _OPERATORS if not hasattr(ops, name)]
     if missing:
@@ -87,8 +119,9 @@ _packs = {}
 _plans = {}
 _scale_seen = set()
 _algo_rank_cache: OrderedDict = OrderedDict()
-_failed_static_algo_keys: set = set()
+_failed_unpacked_algo_keys: set = set()
 _ALGO_RANK_CACHE_MAX_ENTRIES = 4096
+_BLASLT_HEURISTIC_COUNT = 64  # kHeuristicCount in int8_gemm_hipblaslt.h
 _TRITON_SCALE_MIN_ELEMENTS = 4_194_304
 _device_arch_cache: dict = {}
 
@@ -98,53 +131,121 @@ _device_arch_cache: dict = {}
 # Uncovered shapes or non-gfx936 devices fall back directly to algo_rank=0
 # without online trial-and-error probing.
 _DEFAULT_GFX936_UNPACKED_ALGO_RANKS = {
-    # wo_a (target TP8/DP8): 2.2x-9.8x vs algo_rank=0
+    # wo_a (target TP8/DP8/CP8): measured zero-workspace ranks (2048->42, 4096/8192->33, 16384->42; -186.7 ms on 400K)
     (8, 1024, 4096, 0, False): (
         {
-            1: 27, 2: 26, 4: 26, 5: 26, 6: 27, 8: 27, 10: 24, 12: 24, 16: 24,
-            18: 13, 20: 29, 24: 17, 30: 17, 32: 18, 36: 18, 40: 18, 42: 18,
-            48: 20, 64: 20,
+            1: 27, 2: 26, 3: 26, 4: 26, 5: 26, 6: 27, 7: 22, 8: 27, 9: 26, 10: 24,
+            11: 24, 12: 24, 13: 27, 14: 25, 15: 25, 16: 24, 17: 13, 18: 13, 19: 29, 20: 29,
+            21: 13, 22: 18, 23: 29, 24: 17, 25: 12, 26: 12, 27: 17, 28: 17, 29: 17, 30: 17,
+            31: 18, 32: 18, 33: 18, 34: 18, 35: 18, 36: 18, 37: 29, 38: 18, 39: 18, 40: 18,
+            41: 18, 42: 18, 43: 20, 44: 20, 45: 31, 46: 20, 47: 20, 48: 20, 49: 20, 50: 31,
+            51: 31, 52: 20, 53: 20, 54: 31, 55: 20, 56: 20, 57: 20, 58: 31, 59: 20, 60: 20,
+            61: 20, 62: 20, 63: 20, 64: 20, 65: 43, 66: 43, 70: 43, 72: 43, 75: 43, 78: 43,
+            80: 43, 84: 43, 85: 43, 90: 43, 95: 25, 96: 25, 100: 26, 102: 26, 105: 26, 108: 26,
+            110: 26, 114: 26, 115: 26, 120: 26, 125: 51, 126: 51, 130: 43, 132: 43, 135: 6, 150: 43,
+            155: 43, 156: 43, 160: 43, 162: 43, 165: 43, 168: 43, 170: 43, 174: 43, 175: 43, 180: 43,
+            185: 43, 186: 43, 190: 43, 192: 43, 195: 43, 198: 43, 200: 43, 204: 43, 205: 43, 210: 43,
+            215: 43, 216: 43, 220: 43, 222: 43, 225: 43, 228: 43, 230: 43, 234: 43, 235: 43, 240: 43,
+            245: 43, 246: 43, 250: 43, 252: 43, 255: 43, 2048: 42, 4096: 33, 8192: 33, 16384: 42,
         },
-        {128: 1, 256: 5, 512: 6, 1024: 4, 2048: 2, 4096: 1, 8192: 1},
+        {128: 1, 256: 5, 512: 6, 1024: 4, 2048: 42, 4096: 33, 8192: 33, 16384: 42},
     ),
-    # wo_a (draft): 1.9x-24.7x vs algo_rank=0
+    # wo_a (draft): measured zero-workspace ranks
     (8, 512, 4096, 0, False): (
         {
-            1: 4, 2: 4, 4: 3, 6: 4, 8: 4, 12: 2, 16: 3, 24: 31, 32: 11,
-            48: 31, 64: 30,
+            1: 4, 2: 4, 4: 3, 5: 44, 6: 4, 8: 4, 10: 3, 12: 2, 15: 3, 16: 3,
+            20: 32, 24: 31, 25: 36, 30: 11, 32: 11, 35: 46, 40: 35, 45: 36, 48: 31, 50: 46,
+            55: 35, 60: 46, 64: 30, 65: 32, 70: 33, 75: 33, 80: 32, 85: 23, 90: 23, 95: 23,
+            100: 36, 105: 36, 110: 36, 115: 36, 120: 36, 125: 36, 130: 37, 135: 37, 140: 48, 145: 36,
+            150: 36, 155: 47, 160: 36, 165: 14, 170: 14, 175: 14, 180: 14, 185: 11, 190: 14, 195: 40,
+            200: 40, 205: 40, 210: 44, 215: 44, 220: 44, 225: 45, 230: 45, 235: 40, 240: 45, 245: 45,
+            250: 45, 255: 45, 260: 45, 265: 45, 270: 45, 275: 45, 280: 45, 285: 45, 290: 45, 295: 45,
+            300: 45, 305: 45, 310: 41, 315: 45, 320: 45,
         },
-        {128: 6, 256: 15, 512: 23, 1024: 17, 2048: 9, 4096: 8},
+        {128: 36, 256: 45, 512: 45, 1024: 17, 2048: 9, 4096: 8},
     ),
-    # lm_head (full vocab, DP lm_head): 2.2x-7.0x vs algo_rank=0
+    # lm_head (full vocab, DP lm_head): measured zero-workspace ranks (M=258..384->31: 11x-14x vs rank 0)
     (1, 129280, 5120, 0, False): (
         {
-            1: 12, 2: 12, 4: 15, 5: 15, 6: 15, 8: 15, 10: 15, 12: 8, 16: 15,
-            18: 6, 20: 12, 24: 12, 30: 12, 32: 12, 36: 3, 40: 5, 42: 3,
-            48: 3, 64: 5,
+            1: 12, 2: 12, 3: 15, 4: 15, 5: 15, 6: 15, 7: 15, 8: 15, 9: 15, 10: 15,
+            11: 15, 12: 8, 13: 15, 14: 15, 15: 15, 16: 15, 17: 12, 18: 6, 19: 12, 20: 12,
+            21: 12, 22: 12, 23: 6, 24: 12, 25: 12, 26: 12, 27: 6, 28: 8, 29: 12, 30: 12,
+            31: 12, 32: 12, 33: 3, 34: 3, 35: 3, 36: 3, 37: 5, 38: 3, 39: 3, 40: 5,
+            41: 3, 42: 3, 43: 5, 44: 3, 45: 3, 46: 3, 47: 5, 48: 3, 49: 3, 50: 3,
+            51: 3, 52: 3, 53: 5, 54: 3, 55: 3, 56: 3, 57: 3, 58: 3, 59: 3, 60: 3,
+            61: 3, 62: 3, 63: 3, 64: 5, 65: 43, 66: 43, 70: 43, 72: 43, 75: 43, 78: 43,
+            80: 43, 84: 43, 85: 43, 90: 43, 95: 43, 96: 43, 100: 43, 102: 43, 105: 43, 108: 43,
+            110: 43, 114: 43, 115: 43, 120: 43, 125: 43, 126: 43, 130: 31, 132: 31, 135: 31, 138: 31,
+            140: 31, 144: 31, 145: 42, 150: 42, 155: 31, 156: 42, 160: 31, 162: 42, 165: 31, 168: 42,
+            170: 31, 174: 42, 175: 42, 180: 42, 185: 31, 186: 31, 190: 31, 192: 31, 195: 42, 198: 42,
+            200: 42, 204: 42, 205: 42, 210: 42, 215: 42, 216: 42, 220: 42, 222: 42, 225: 42, 228: 42,
+            230: 42, 234: 42, 235: 42, 240: 42, 245: 42, 246: 42, 250: 42, 252: 42, 255: 42, 258: 31,
+            260: 31, 264: 31, 265: 31, 270: 31, 275: 31, 276: 31, 280: 31, 282: 31, 285: 31, 288: 31,
+            290: 31, 294: 31, 295: 31, 300: 31, 305: 31, 306: 31, 310: 31, 312: 31, 315: 31, 318: 31,
+            320: 31, 324: 31, 330: 31, 336: 31, 342: 31, 348: 31, 354: 31, 360: 31, 366: 31, 372: 31,
+            378: 31, 384: 31,
         },
-        {128: 14, 256: 2},
+        {128: 43, 256: 42, 512: 31},
     ),
-    # lm_head (TP8 sharded): 2.5x-8.0x vs algo_rank=0
+    # lm_head (TP8 sharded): measured zero-workspace ranks
     (1, 16160, 5120, 0, False): (
         {
-            1: 15, 2: 15, 4: 12, 5: 15, 6: 15, 8: 15, 12: 15, 16: 15,
-            24: 12, 32: 1, 48: 2, 64: 19,
+            1: 15, 2: 15, 3: 15, 4: 12, 5: 15, 6: 15, 7: 15, 8: 15, 9: 15, 10: 15,
+            11: 15, 12: 15, 13: 15, 14: 15, 15: 15, 16: 15, 17: 12, 18: 12, 19: 12, 20: 12,
+            21: 12, 22: 12, 23: 12, 24: 12, 25: 12, 26: 12, 27: 12, 28: 12, 29: 12, 30: 12,
+            31: 1, 32: 1, 33: 6, 34: 3, 35: 6, 36: 6, 37: 6, 38: 6, 39: 6, 40: 6,
+            41: 6, 42: 2, 43: 2, 44: 6, 45: 6, 46: 6, 47: 2, 48: 2, 49: 6, 50: 2,
+            51: 6, 52: 2, 53: 2, 54: 2, 55: 6, 56: 2, 57: 2, 58: 2, 59: 6, 60: 2,
+            61: 2, 62: 2, 63: 2, 64: 19, 65: 31, 66: 31, 70: 31, 72: 31, 75: 31, 78: 31,
+            80: 31, 84: 43, 85: 43, 88: 43, 90: 43, 95: 43, 96: 43, 100: 43, 102: 43, 104: 43,
+            105: 43, 108: 43, 110: 43, 112: 43, 114: 43, 115: 43, 120: 43, 125: 43, 126: 43, 128: 43,
+            130: 42, 132: 42, 135: 42, 136: 42, 138: 42, 140: 42, 144: 42, 145: 42, 150: 42, 152: 42,
+            155: 42, 156: 42, 160: 42, 162: 42, 165: 42, 168: 42, 170: 42, 174: 42, 175: 42, 176: 42,
+            180: 42, 184: 42, 185: 42, 186: 42, 190: 42, 192: 42, 195: 42, 198: 42, 200: 42, 204: 42,
+            205: 42, 208: 42, 210: 42, 215: 42, 216: 42, 220: 42, 222: 42, 224: 42, 225: 42, 228: 42,
+            230: 42, 232: 42, 234: 42, 235: 42, 240: 42, 245: 42, 246: 42, 248: 42, 250: 42, 252: 42,
+            255: 42, 256: 42, 258: 31, 260: 42, 264: 42, 265: 42, 270: 31, 272: 31, 275: 42, 276: 42,
+            280: 31, 282: 31, 285: 42, 288: 31, 290: 31, 294: 31, 295: 31, 296: 31, 300: 31, 304: 31,
+            305: 31, 306: 31, 310: 31, 312: 42, 315: 31, 318: 31, 320: 31, 324: 31, 328: 31, 330: 31,
+            336: 42, 342: 31, 344: 31, 348: 42, 352: 42, 354: 31, 360: 31, 366: 31, 368: 31, 372: 31,
+            376: 31, 378: 31, 384: 31, 392: 42, 400: 31, 408: 31, 416: 31, 424: 42, 432: 31, 440: 42,
+            448: 31, 456: 42, 464: 31, 472: 31, 480: 42, 488: 31, 496: 42, 504: 31, 512: 42, 520: 31,
+            528: 31, 560: 31, 576: 31, 600: 31, 624: 31, 640: 31, 672: 31, 680: 31, 720: 31, 760: 31,
+            768: 31, 800: 31, 816: 31, 840: 31, 864: 31, 880: 31, 912: 31, 920: 31, 960: 31, 1000: 31,
+            1008: 31, 1040: 31, 1056: 31, 1080: 31, 1104: 31, 1120: 31, 1152: 31, 1160: 31, 1200: 31, 1240: 31,
+            1248: 31, 1280: 31, 1296: 31, 1320: 31, 1344: 31, 1360: 31, 1392: 31, 1400: 31, 1440: 31, 1480: 31,
+            1488: 31, 1520: 31, 1536: 31, 1560: 31, 1584: 31, 1600: 31, 1632: 31, 1640: 31, 1680: 31, 1720: 31,
+            1728: 31, 1760: 31, 1776: 31, 1800: 31, 1824: 31, 1840: 31, 1872: 31, 1880: 31, 1920: 31, 1960: 31,
+            1968: 31, 2000: 31, 2016: 31, 2040: 31, 2064: 31, 2080: 31, 2112: 31, 2120: 31, 2160: 31, 2200: 31,
+            2208: 31, 2240: 31, 2256: 31, 2280: 31, 2304: 31, 2320: 31, 2352: 31, 2360: 31, 2400: 31, 2440: 31,
+            2448: 31, 2480: 31, 2496: 31, 2520: 31, 2544: 31, 2560: 31, 2592: 31, 2640: 31, 2688: 31, 2736: 31,
+            2784: 31, 2832: 31, 2880: 31, 2928: 31, 2976: 31, 3024: 31, 3072: 31,
         },
-        {128: 3, 256: 3, 512: 6, 1024: 3, 2048: 3, 4096: 3},
+        {128: 43, 256: 42, 512: 42, 1024: 31, 2048: 31, 4096: 31},
     ),
-    # DSPARK markov_head (TP8 sharded): 1.4x-3.0x vs algo_rank=0
+    # DSPARK markov_head (TP8 sharded): measured zero-workspace ranks
     (1, 16160, 256, 0, False): (
         {
-            1: 16, 2: 8, 4: 11, 5: 15, 6: 4, 8: 10, 12: 20, 16: 15,
-            24: 11, 32: 15, 48: 11, 64: 3,
+            1: 16, 2: 16, 3: 16, 4: 7, 5: 16, 6: 7, 7: 7, 8: 7, 9: 16, 10: 16,
+            11: 16, 12: 16, 13: 16, 14: 16, 15: 5, 16: 15, 17: 17, 18: 17, 19: 17, 20: 17,
+            21: 17, 22: 17, 23: 17, 24: 17, 25: 17, 26: 17, 27: 17, 28: 12, 29: 17, 30: 17,
+            31: 21, 32: 1, 33: 6, 34: 60, 35: 60, 36: 60, 37: 60, 38: 60, 39: 60, 40: 60,
+            41: 2, 42: 60, 43: 60, 44: 60, 45: 60, 46: 60, 47: 60, 48: 60, 49: 50, 50: 60,
+            51: 60, 52: 60, 53: 60, 54: 2, 55: 60, 56: 50, 57: 2, 58: 60, 59: 60, 60: 60,
+            61: 60, 62: 60, 63: 60, 64: 60,
         },
         {128: 19, 256: 14},
     ),
-    # DSPARK markov_head (full vocab): 1.5x-3.4x vs algo_rank=0
+    # DSPARK markov_head (full vocab): measured zero-workspace ranks
     (1, 129280, 256, 0, False): (
         {
-            1: 18, 2: 18, 4: 16, 5: 16, 6: 1, 8: 16, 12: 1, 16: 1,
-            24: 12, 32: 12, 48: 4, 64: 3,
+            1: 47, 2: 47, 3: 47, 4: 47, 5: 47, 6: 47, 7: 38, 8: 38, 9: 27, 10: 47,
+            11: 27, 12: 1, 13: 38, 14: 38, 15: 38, 16: 1, 17: 52, 18: 52, 19: 52, 20: 52,
+            21: 53, 22: 52, 23: 52, 24: 52, 25: 52, 26: 52, 27: 53, 28: 53, 29: 53, 30: 53,
+            31: 52, 32: 12, 33: 52, 34: 52, 35: 52, 36: 52, 37: 52, 38: 52, 39: 52, 40: 52,
+            41: 52, 42: 52, 43: 52, 44: 52, 45: 52, 46: 52, 47: 53, 48: 53, 49: 52, 50: 52,
+            51: 52, 52: 52, 53: 53, 54: 52, 55: 52, 56: 52, 57: 52, 58: 52, 59: 52, 60: 52,
+            61: 60, 62: 53, 63: 39, 64: 39,
         },
         {128: 4, 256: 19},
     ),
@@ -442,10 +543,72 @@ def quantize(x):
     return q, scales
 
 
+class _UnpackedAlgo(NamedTuple):
+    rank: int
+    workspace_bytes: int = 0
+
+
+def _parse_unpacked_algo(value):
+    if isinstance(value, dict):
+        rank = value["rank"]
+        workspace = value.get("workspace_bytes", 0)
+    else:
+        # The original wo_a_algo.json loader also accepted decimal strings.
+        rank = int(value) if isinstance(value, str) else value
+        workspace = 0
+    if (
+        type(rank) is not int
+        or not 0 <= rank < _BLASLT_HEURISTIC_COUNT
+        or type(workspace) is not int
+        or not 0 <= workspace < 2**32
+    ):
+        raise ValueError(
+            "expected a heuristic rank in [0, 64) and valid workspace bytes"
+        )
+    return _UnpackedAlgo(rank, workspace)
+
+
 @lru_cache(maxsize=4)
 def _algorithm_config(path):
-    with open(path) as f:
-        return json.load(f)["algorithms"]
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        logger.warning(
+            "INT8 algorithm file %s is missing. Using runtime defaults.", path
+        )
+        return {}, {}
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read INT8 algorithm file {path}: {exc}") from exc
+    try:
+        algorithms = {
+            key: _parse_unpacked_algo(value)
+            for key, value in data["algorithms"].items()
+        }
+        w8a8 = {}
+        for key, value in data.get("w8a8", {}).items():
+            kind = value.get("backend", "hipblaslt")
+            if kind == "hipblaslt":
+                w8a8[key] = (kind, _parse_unpacked_algo(value))
+            elif kind == "lightop_channel":
+                w8a8[key] = (kind, 0)
+            elif (
+                kind == "smooth_asm"
+                and type(value.get("tune")) is int
+                and value["tune"] in (1, 2, 3, 4, 9)
+            ):
+                w8a8[key] = (kind, value["tune"])
+            else:
+                raise ValueError(f"invalid W8A8 selection at {key}")
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid INT8 algorithm file {path}: {exc}") from exc
+    return algorithms, w8a8
+
+
+def configured_w8a8_algo(path, device, method, m, n, k):
+    if not _is_gfx936_device(device):
+        return None
+    return _algorithm_config(path)[1].get(f"{method}:{m}:{n}:{k}")
 
 
 def _blaslt_static_algo_enabled() -> bool:
@@ -486,27 +649,13 @@ def _lookup_default_unpacked_algo_rank(
 ):
     if not _blaslt_static_algo_enabled() or not _is_gfx936_device(device):
         return None
-    cache_key = (
-        getattr(device, "index", None),
-        _autotune_t_bucket(t),
-        groups,
-        rank,
-        k,
-        tile_n,
-        bool(group_major),
-    )
-    if cache_key in _failed_static_algo_keys:
-        return None
     spec = _DEFAULT_GFX936_UNPACKED_ALGO_RANKS.get(
         (groups, rank, k, tile_n, bool(group_major))
     )
     if spec is None:
         return None
     exact_map, bucket_map = spec
-    if t <= 64:
-        return exact_map.get(t)
-    t_bucket = _autotune_t_bucket(t)
-    return bucket_map.get(t_bucket)
+    return exact_map.get(t, bucket_map.get(_autotune_t_bucket(t)))
 
 
 def _autotune_t_bucket(t: int) -> int:
@@ -531,8 +680,14 @@ def _select_unpacked_algo_rank(ops, q, w, raw, groups, rank, k, tile_n, group_ma
             return cached
         if torch.cuda.is_current_stream_capturing():
             return 0
-        max_ranks = max(
-            1, int(os.environ.get("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE_MAX_RANKS", "32"))
+        max_ranks = min(
+            _BLASLT_HEURISTIC_COUNT,
+            max(
+                1,
+                int(
+                    os.environ.get("SGLANG_DSV41_INT8_BLASLT_AUTOTUNE_MAX_RANKS", "64")
+                ),
+            ),
         )
         best_rank = 0
         best_ms = float("inf")
@@ -576,7 +731,97 @@ def _select_unpacked_algo_rank(ops, q, w, raw, groups, rank, k, tile_n, group_ma
         return best_rank
 
 
-def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, group_major=False, algo_rank=None):
+def _try_unpacked_gemm(ops, q, w, raw, groups, tile_n, group_major, algo):
+    m = q.shape[1] if group_major else q.shape[0]
+    key = (q.device, m, tuple(w.shape), groups, tile_n, group_major, algo)
+    if key in _failed_unpacked_algo_keys:
+        return False
+    try:
+        if algo.workspace_bytes:
+            ops.gemm_tuned_out(
+                q, w, raw, groups, tile_n, group_major, algo.rank, algo.workspace_bytes
+            )
+        else:
+            ops.gemm_out(q, w, raw, groups, tile_n, group_major, algo.rank)
+    except RuntimeError as exc:
+        rejected = str(exc).startswith(
+            (
+                "No compatible hipBLASLt INT8 algorithm",
+                "No zero-workspace hipBLASLt INT8",
+                "DSV41 INT8 hipBLASLt ",
+                "The installed kernel wheel lacks dsv41_int8_gemm_tuned_out",
+            )
+        )
+        if not rejected and not (
+            algo.workspace_bytes and isinstance(exc, torch.OutOfMemoryError)
+        ):
+            raise
+        with _lock:
+            _failed_unpacked_algo_keys.add(key)
+        return False
+    return True
+
+
+def _scale_unpacked(ops, raw, xs, ws, out, groups, group_major):
+    t, _, rank = out.shape
+    numel = out.numel()
+    if (
+        out.is_cuda
+        and torch.version.hip is not None
+        and numel >= _TRITON_SCALE_MIN_ELEMENTS
+    ):
+        block = 2048
+        _scale_int32_dynamic[(triton.cdiv(numel, block),)](
+            raw,
+            xs,
+            ws,
+            out,
+            t,
+            numel,
+            groups,
+            rank,
+            bool(group_major),
+            block,
+            num_warps=8,
+            enable_fp_fusion=False,
+        )
+    else:
+        ops.scale_out(raw, xs, ws, out, groups, group_major)
+
+
+def try_w8a8_blaslt(q, weight, xs, ws, out_dtype, algo):
+    """Apply a validated dense override to the existing prequantized operand."""
+    m = q.shape[0]
+    n = weight.shape[0]
+    try:
+        ops = load_native()
+    except RuntimeError as exc:
+        if str(exc).startswith("Rebuild the matching HCU"):
+            return None
+        raise
+    try:
+        raw = torch.empty((m, 1, n), device=q.device, dtype=torch.int32)
+        out = torch.empty((m, 1, n), device=q.device, dtype=out_dtype)
+    except torch.OutOfMemoryError:
+        return None  # The fused LightOp baseline may need only its output buffer.
+    if not _try_unpacked_gemm(ops, q.unsqueeze(1), weight, raw, 1, 0, False, algo):
+        return None
+    _scale_unpacked(ops, raw, xs, ws, out, 1, False)
+    return out.view(m, n)
+
+
+def _project_unpacked(
+    x,
+    w,
+    s,
+    groups,
+    rank,
+    *,
+    output_dtype=None,
+    tile_n=None,
+    group_major=False,
+    algo_rank=None,
+):
     if (
         x.ndim != 3 or x.shape[1] != groups or groups <= 0 or rank <= 0
         or w.shape != (groups * rank, x.shape[-1])
@@ -593,69 +838,42 @@ def _project_unpacked(x, w, s, groups, rank, *, output_dtype=None, tile_n=None, 
         tile_n = int(os.environ.get("SGLANG_DSV41_INT8_BLASLT_TILE_N", "0")) if groups == 1 else 0
     if tile_n < 0:
         raise ValueError("INT8 BLASLt tile size must be non-negative")
-    ops = load_native()
-    t = x.shape[0]
-    k = x.shape[-1]
-    use_autotune = False
-    used_static = False
-    if algo_rank is None:
-        config = os.environ.get("SGLANG_DSV41_INT8_BLASLT_ALGO_CONFIG")
-        if config:
-            key = f"{t}:{groups}:{rank}:{k}:{tile_n}:{int(group_major)}"
-            algo_rank = int(_algorithm_config(config).get(key, 0))
-        elif _blaslt_autotune_enabled():
-            use_autotune = True
-        else:
-            static_rank = _lookup_default_unpacked_algo_rank(
-                x.device, t, groups, rank, k, tile_n, group_major
-            )
-            if static_rank is not None:
-                algo_rank = static_rank
-                used_static = True
-            else:
-                algo_rank = 0
+    t, _, k = x.shape
     y = torch.empty((t, groups, rank), device=x.device, dtype=output_dtype)
     if not t:
         return y
+    ops = load_native()
     q, xs = quantize(x)
     if group_major:
         q = q.transpose(0, 1).contiguous()
     raw = torch.empty((groups, t, rank) if group_major else (t, groups, rank),
                       device=x.device, dtype=torch.int32)
-    if use_autotune:
-        algo_rank = _select_unpacked_algo_rank(
-            ops, q, w, raw, groups, rank, k, tile_n, group_major
-        )
-    try:
+    if algo_rank is not None:
         ops.gemm_out(q, w, raw, groups, tile_n, group_major, algo_rank)
-    except RuntimeError:
-        if (use_autotune or used_static) and algo_rank != 0:
-            fail_key = (
-                getattr(x.device, "index", None),
-                _autotune_t_bucket(t),
-                groups,
-                rank,
-                k,
-                tile_n,
-                bool(group_major),
-            )
-            with _lock:
-                if used_static:
-                    _failed_static_algo_keys.add(fail_key)
-                if use_autotune:
-                    _algo_rank_cache[fail_key] = 0
-            ops.gemm_out(q, w, raw, groups, tile_n, group_major, 0)
-        else:
-            raise
-    numel = t * groups * rank
-    if y.is_cuda and torch.version.hip is not None and numel >= _TRITON_SCALE_MIN_ELEMENTS:
-        sb = 2048
-        _scale_int32_dynamic[(triton.cdiv(numel, sb),)](
-            raw, xs, s, y, t, numel, groups, rank, bool(group_major), sb,
-            num_warps=8, enable_fp_fusion=False,
-        )
     else:
-        ops.scale_out(raw, xs, s, y, groups, group_major)
+        config = os.environ.get("SGLANG_DSV41_INT8_BLASLT_ALGO_CONFIG")
+        tuned = None
+        if config:
+            key = f"{t}:{groups}:{rank}:{k}:{tile_n}:{int(group_major)}"
+            algorithms, _ = _algorithm_config(config)
+            dtype_name = str(output_dtype).removeprefix("torch.")
+            tuned = algorithms.get(f"{key}:{dtype_name}", algorithms.get(key))
+        if tuned is None or not _try_unpacked_gemm(
+            ops, q, w, raw, groups, tile_n, group_major, tuned
+        ):
+            if _blaslt_autotune_enabled():
+                default_rank = _select_unpacked_algo_rank(
+                    ops, q, w, raw, groups, rank, k, tile_n, group_major
+                )
+            else:
+                default_rank = _lookup_default_unpacked_algo_rank(
+                    x.device, t, groups, rank, k, tile_n, group_major
+                )
+            if not default_rank or not _try_unpacked_gemm(
+                ops, q, w, raw, groups, tile_n, group_major, _UnpackedAlgo(default_rank)
+            ):
+                ops.gemm_out(q, w, raw, groups, tile_n, group_major, 0)
+    _scale_unpacked(ops, raw, xs, s, y, groups, group_major)
     return y
 
 

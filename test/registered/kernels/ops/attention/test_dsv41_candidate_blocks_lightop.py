@@ -98,6 +98,26 @@ class TestDsv41CandidateBlocksLightop(CustomTestCase):
                 torch.testing.assert_close(mask.cpu(), expected_mask, rtol=0, atol=0)
                 torch.testing.assert_close(ids.cpu(), expected_ids, rtol=0, atol=0)
 
+    def test_id_only_table_matches_mask_kernel(self):
+        for width, lengths in (
+            (1031, [0, 1, 1029]),
+            (409599, [0, 16384, 65539, 409599]),
+        ):
+            with self.subTest(width=width), patch.dict(os.environ, {FLAG: "1"}):
+                logits, lens = make_case(width, lengths, ties=True)
+                _, expected = candidate_indexer.select_candidate_blocks(
+                    logits, lens, 2048, 8, return_block_ids=True
+                )
+                with patch.object(
+                    lightop_indexer,
+                    "candidate_block_mask",
+                    side_effect=AssertionError("IDs must use the mask-free table"),
+                ):
+                    actual = candidate_indexer.select_candidate_blocks(
+                        logits, lens, 2048, 8, return_mask=False
+                    )
+                self.assertTrue(torch.equal(actual, expected))
+
     def test_missing_package_wrapper_or_native_raises(self):
         logits, lengths = make_case(20000, [0, 9, 20000])
         symbol = SimpleNamespace(dsv41_select_candidate_blocks=object())

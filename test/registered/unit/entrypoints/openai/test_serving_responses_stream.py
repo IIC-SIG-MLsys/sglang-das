@@ -215,6 +215,27 @@ class NonHarmonyStreamTestCase(CustomTestCase):
             "final_answer",
         )
 
+    def test_streaming_text_does_not_match_done_sentinel(self):
+        """The legacy PD end-marker scan also sees named SSE events."""
+        serving = make_serving()
+        serving.reasoning_parser = None
+        serving.tool_call_parser = None
+        request = ResponsesRequest(model="x", input="hi", stream=True, store=False)
+        text = "The model wrote data: [DONE]."
+
+        events = StreamFixture(serving, request).run([engine_chunk(text, finish=True)])
+
+        self.assertNotIn("data: [DONE]", "".join(events))
+        self.assertEqual(event_types(events)[-1], "response.completed")
+        self.assertEqual(
+            "".join(
+                payload["delta"]
+                for payload in event_payloads(events)
+                if payload["type"] == "response.output_text.delta"
+            ),
+            text,
+        )
+
     def test_truncated_and_aborted_streams_have_matching_terminal_events(self):
         reset_context()
         self.addCleanup(reset_context)

@@ -6,10 +6,13 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsv4 import (
+    compact_fp4_candidate_logits as compact_ops,
+)
 from sglang.kernels.ops.attention.dsv4 import topk as dsv4_topk
 from sglang.srt.arg_groups.deepseek_v4_hook import apply_deepseek_v4_defaults
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention import deepseek_v4_backend
+from sglang.srt.layers.attention import deepseek_v4_backend, mqa_logits_utils
 from sglang.srt.mem_cache import deepseek_v4_memory_pool
 from sglang.srt.model_executor.runner_utils import capture_mode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -913,18 +916,17 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
             self.assertIs(actual, expected)
 
     def test_candidate_logits_performance_cutoff_uses_compressed_k_length(self):
-        for width, enabled in ((32768, False), (65535, False), (65536, True)):
-            with self.subTest(width=width):
-                backend, indexer, lc_per_req, q_lens_cpu, blocks = (
-                    self._candidate_fixture(lc_per_req=[32768, 0, width])
+        for width, compact, scorer in (
+            (32768, False, "dense"),
+            (65535, False, "dense"),
+            (65536, False, "lightop_candidates"),
+            (32768, True, "compact"),
+            (65535, True, "compact"),
+        ):
+            with self.subTest(compressed_width=width, compact=compact):
+                self._check_dense_candidate_route(
+                    width, scorer, compact_available=compact
                 )
-                selected = self._candidate_route(
-                    backend, indexer, lc_per_req, q_lens_cpu
-                )
-                if enabled:
-                    self.assertIs(selected, blocks)
-                else:
-                    self.assertIsNone(selected)
 
     def test_candidate_logits_defaults_on_and_respects_explicit_override(self):
         backend, indexer, lc_per_req, q_lens_cpu, blocks = self._candidate_fixture()
@@ -1154,20 +1156,51 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                 self.assertTrue(torch.isneginf(dense[1, :8]).all())
 
     def test_dense_indexer_propagates_candidate_guard_and_preserves_indices(self):
+        for flag, available, paged_sparse, head_dim, scorer in (
+            ("0", True, False, None, "dense"),
+            ("1", True, False, None, "lightop_candidates"),
+            ("1", False, False, None, "dense"),
+            ("1", True, True, None, "lightop_candidates"),
+            ("1", True, True, 128, "lightop_candidates"),
+        ):
+            with self.subTest(
+                flag=flag,
+                available=available,
+                paged_sparse=paged_sparse,
+                head_dim=head_dim,
+            ):
+                self._check_dense_candidate_route(
+                    65536,
+                    scorer,
+                    flag=flag,
+                    lightop_available=available,
+                    paged_sparse=paged_sparse,
+                    head_dim=head_dim,
+                )
+
+    def _check_dense_candidate_route(
+        self,
+        width,
+        scorer,
+        *,
+        flag="1",
+        lightop_available=True,
+        compact_available=False,
+        paged_sparse=False,
+        head_dim=None,
+    ):
         backend, batch, _ = self._indexer_fixture([1, 0, 1])
+        last_block = (width - 1) // 8
+        last_block_start = last_block * 8
+        long_blocks = torch.full((1, 2048), -1, dtype=torch.int32)
+        long_blocks[0, 0] = last_block
+        blocks = [
+            torch.tensor([[0]], dtype=torch.int32),
+            torch.empty(0, 0, dtype=torch.int32),
+            long_blocks,
+        ]
         backend.forward_metadata.candidate_metadata = (
-            deepseek_v4_backend.CandidateMasks(
-                request_masks=[
-                    torch.tensor([[True] * 8 + [False] * 3]),
-                    torch.empty(0, 0, dtype=torch.bool),
-                    torch.arange(65536)[None, :] >= 65528,
-                ],
-                request_block_ids=[
-                    torch.tensor([[0]], dtype=torch.int32),
-                    torch.empty(0, 0, dtype=torch.int32),
-                    torch.tensor([[8191]], dtype=torch.int32),
-                ],
-            )
+            deepseek_v4_backend.CandidateMasks(request_block_ids=blocks)
         )
         pages = torch.empty(2, 12, dtype=torch.int32)
         raw = torch.empty_like(pages)
@@ -1175,9 +1208,11 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
             sparse_page_indices=lambda ratio: pages,
             sparse_raw_indices=lambda ratio: raw,
         )
-        backend.req_to_token = torch.arange(65536)[None, :].expand(10, -1)
+        ratio = 2
+        backend.req_to_token = (torch.arange(width * ratio) * 3).expand(10, -1)
+        backend.dsv41_hcu_indexer_kernels = False
         backend.token_to_kv_pool = SimpleNamespace(
-            get_low_ratio_index_k_fp4=lambda layer, slots: (slots, slots)
+            get_low_ratio_index_k_fp4=lambda layer, slots, **kwargs: (slots, slots)
         )
         indexer = SimpleNamespace(
             uses_candidates=True,
@@ -1186,89 +1221,151 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
             candidate_topk_blocks=2048,
             n_local_heads=32,
             index_topk=12,
+            rope_head_dim=64,
+            wq_b=Mock(side_effect=AssertionError("paged query projection was called")),
             queries=lambda q, freq: torch.zeros(2, 32, 128, dtype=torch.bfloat16),
             head_weights=lambda x: torch.ones(2, 32),
         )
+        if head_dim is not None:
+            indexer.index_head_dim = head_dim
         layer = SimpleNamespace(
-            compress_ratio=1,
+            compress_ratio=ratio,
             layer_id=24,
             indexer=indexer,
-            freqs_cis=torch.zeros(65536),
+            freqs_cis=torch.zeros(width * ratio),
         )
-        batch.seq_lens_cpu = [11, 0, 65536]
-        pos = torch.tensor([1, 65535], dtype=torch.int64)
-        results = []
-        for flag, available in (("0", True), ("1", True), ("1", False)):
-            lightop = ModuleType("lightop")
-            lightop.topk_transform_ragged_v2 = Mock(
-                side_effect=self._ragged_topk_reference
+        batch.seq_lens_cpu = [11 * ratio, 0, width * ratio]
+        batch.forward_mode = deepseek_v4_backend.ForwardMode.EXTEND
+        pos = torch.tensor([2 * ratio - 1, width * ratio - 1], dtype=torch.int64)
+
+        def dense_logits(q, kv, weights, ks, ke, padded_width, **kwargs):
+            columns = torch.arange(padded_width)
+            logits = (
+                columns.expand(2, -1)
+                .float()
+                .masked_fill_(columns >= (ke - ks)[:, None], -torch.inf)
+            )
+            if kwargs["candidate_blocks"] is not None:
+                logits[1, :last_block_start] = -torch.inf
+            return logits
+
+        def compact_logits(q, kv, weights, ks, ke, block_table):
+            columns = (8 * block_table[:, :, None] + torch.arange(8)).flatten(1)
+            return columns.float().masked_fill_(
+                (columns < 0) | (columns >= (ke - ks)[:, None]), -torch.inf
             )
 
-            def logits_boundary(q, k, weights, ks, ke, width, **kwargs):
-                logits = torch.full((2, width), -torch.inf)
-                logits[0, :2] = torch.arange(2, dtype=torch.float32)
-                logits[1, :] = torch.arange(width, dtype=torch.float32)
-                if kwargs["candidate_blocks"] is not None:
-                    logits[0, 2:11] = -torch.inf
-                    logits[1, :65528] = -torch.inf
-                return logits
+        def postprocess(scores, selected, ks, slots, pages, raw, filter_masked):
+            for row, ids in enumerate(selected):
+                ids = ids[ids >= 0]
+                if filter_masked:
+                    ids = ids[scores[row, ids - ks[row]] > -torch.inf]
+                ids = ids.sort().values
+                pages[row, : ids.numel()] = slots[ids].to(torch.int32)
+                raw[row, : ids.numel()] = ids - ks[row]
 
-            with (
-                patch.object(deepseek_v4_backend, "_is_hcu", True),
-                patch.object(dsv4_topk, "_IS_HCU", True),
-                patch.object(
-                    dsv4_topk,
-                    "_jit_topk_v2_module",
-                    side_effect=AssertionError("HCU must not load CUDA JIT"),
-                ),
-                patch.dict("sys.modules", {"lightop": lightop}),
-                patch.object(
-                    deepseek_v4_backend,
-                    "_hcu_candidate_logits_available",
-                    return_value=available,
-                ),
-                patch.object(
-                    deepseek_v4_backend,
-                    "_hcu_dense_fp4_mqa_logits",
-                    side_effect=logits_boundary,
-                ),
-                patch.object(
-                    backend,
-                    "_publish_or_consume_candidates",
-                    wraps=backend._publish_or_consume_candidates,
-                ) as publish,
-                patch.dict(os.environ, {"SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS": flag}),
-            ):
-                backend._low_ratio_index_topk_dense(
-                    layer,
-                    torch.zeros(2, 1),
-                    torch.zeros(2, 1),
-                    pos,
-                    batch,
-                    batch.extend_seq_lens,
-                    batch.extend_seq_lens_cpu,
-                )
+        lightop = ModuleType("lightop")
+        lightop.topk_transform_ragged_v2 = Mock(side_effect=self._ragged_topk_reference)
+        attention = ModuleType("lightop.attention")
+        attention.dsv41_ragged_topk_postprocess = postprocess
+        attention.get_paged_sparse_mqa_logits_metadata = Mock(
+            side_effect=AssertionError
+        )
+        attention.sparse_fp8_fp4_paged_mqa_logits = Mock(side_effect=AssertionError)
+        with (
+            patch.object(deepseek_v4_backend, "_is_hcu", True),
+            patch.object(dsv4_topk, "_IS_HCU", True),
+            patch.object(
+                dsv4_topk,
+                "_jit_topk_v2_module",
+                side_effect=AssertionError("HCU must not load CUDA JIT"),
+            ),
+            patch.dict(
+                "sys.modules", {"lightop": lightop, "lightop.attention": attention}
+            ),
+            patch.object(
+                deepseek_v4_backend,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_mode="prefill"),
+            ),
+            patch.object(
+                mqa_logits_utils, "dsv41_mqa_logits_rows_per_chunk", return_value=None
+            ),
+            patch.object(
+                deepseek_v4_backend,
+                "_hcu_candidate_logits_available",
+                return_value=lightop_available,
+            ),
+            patch.object(
+                compact_ops,
+                "compact_fp4_candidate_logits_available",
+                return_value=compact_available,
+            ),
+            patch.object(
+                compact_ops, "compact_fp4_candidate_logits", side_effect=compact_logits
+            ) as compact,
+            patch.object(
+                deepseek_v4_backend,
+                "_hcu_dense_fp4_mqa_logits",
+                side_effect=dense_logits,
+            ) as dense,
+            patch.object(
+                backend,
+                "_publish_or_consume_candidates",
+                wraps=backend._publish_or_consume_candidates,
+            ) as publish,
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS": flag,
+                    "SGLANG_HCU_PREFILL_PAGED_SPARSE": "1" if paged_sparse else "0",
+                    "SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS": "1",
+                },
+            ),
+        ):
+            backend._low_ratio_index_topk_dense(
+                layer,
+                torch.zeros(2, 1),
+                torch.zeros(2, 1),
+                pos,
+                batch,
+                batch.extend_seq_lens,
+                batch.extend_seq_lens_cpu,
+            )
+        if scorer == "compact":
+            dense.assert_not_called()
+            self.assertEqual(
+                [call.args[-1].shape[1] for call in compact.call_args_list], [1, 2048]
+            )
+        else:
+            compact.assert_not_called()
+            dense.assert_called_once()
+            self.assertIs(
+                dense.call_args.kwargs["candidate_blocks"],
+                blocks if scorer == "lightop_candidates" else None,
+            )
             self.assertEqual(
                 publish.call_args.kwargs["logits_already_masked"],
-                flag == "1" and available,
+                scorer == "lightop_candidates",
             )
             fused = lightop.topk_transform_ragged_v2
             fused.assert_called_once()
-            self.assertEqual(fused.call_args.args[1].tolist(), [2, 65536])
+            self.assertEqual(fused.call_args.args[1].tolist(), [2, width])
             self.assertEqual(fused.call_args.kwargs["out_offsets"].tolist(), [0, 11])
             self.assertEqual(
                 tuple(fused.call_args.kwargs["out_indices"].shape), (2, 12)
             )
             self.assertIsNone(fused.call_args.kwargs["row_starts"])
-            results.append((pages.clone(), raw.clone()))
-        for result in results[1:]:
-            for actual, expected in zip(result, results[0]):
-                torch.testing.assert_close(actual, expected)
         self.assertEqual(raw[0].tolist(), [0, 1] + [-1] * 10)
-        self.assertEqual(raw[1].tolist(), list(range(65528, 65536)) + [-1] * 4)
+        self.assertEqual(
+            raw[1].tolist(),
+            list(range(last_block_start, width))
+            + [-1] * (12 - (width - last_block_start)),
+        )
+        torch.testing.assert_close(pages, torch.where(raw >= 0, 3 * raw, -1))
 
     def _publish_candidate_fixture(
-        self, lc_per_req, enabled, *, logits_already_masked=False
+        self, lc_per_req, enabled, *, causal_logits=False, paged_sparse=False
     ):
         q_lens_cpu = [2, 0, 1]
         backend, indexer, _, _, _ = self._candidate_fixture(q_lens_cpu, lc_per_req)
@@ -1280,6 +1377,11 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
         compress_lens = torch.tensor(
             [min(10, lc_per_req[0]), lc_per_req[0], lc_per_req[2]], dtype=torch.int32
         )
+        if causal_logits:
+            logits.masked_fill_(
+                torch.arange(width)[None, :] >= compress_lens[:, None], -torch.inf
+            )
+        version = logits._version
         with (
             patch.object(deepseek_v4_backend, "_is_hcu", True),
             patch.object(
@@ -1287,7 +1389,9 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                 "_hcu_candidate_logits_available",
                 return_value=True,
             ),
-            patch.dict(os.environ),
+            patch.dict(
+                os.environ, {"SGLANG_HCU_PREFILL_PAGED_SPARSE": str(int(paged_sparse))}
+            ),
         ):
             flag = "1" if enabled is True else "0" if enabled is False else enabled
             if flag is None:
@@ -1301,16 +1405,21 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
                 lc_per_req,
                 q_lens_cpu,
                 torch.zeros(0, 0, dtype=torch.bool),
-                logits_already_masked=logits_already_masked,
+                causal_logits=causal_logits,
             )
+        if causal_logits:
+            self.assertEqual(logits._version, version)
         return backend.forward_metadata.candidate_metadata, logits
 
-    def test_candidate_source_never_skips_publication_or_causal_mask(self):
+    def test_candidate_source_uses_clean_logits_without_remasking(self):
         expected, expected_logits = self._publish_candidate_fixture([17, 0, 11], False)
         candidate, logits = self._publish_candidate_fixture(
-            [17, 0, 11], False, logits_already_masked=True
+            [17, 0, 11], False, causal_logits=True
         )
-        torch.testing.assert_close(logits, expected_logits)
+        for row, width in enumerate([17, 17, 11]):
+            self.assertTrue(
+                torch.equal(logits[row, :width], expected_logits[row, :width])
+            )
         for mask, baseline in zip(candidate.request_masks, expected.request_masks):
             torch.testing.assert_close(mask, baseline)
         self.assertTrue(torch.isneginf(logits[0, 10:17]).all())
@@ -1329,63 +1438,53 @@ class TestDeepseekV4SparsePrefillRouting(CustomTestCase):
         candidate, logits = self._publish_candidate_fixture(lc_per_req, True)
         baseline, _ = self._publish_candidate_fixture(lc_per_req, False)
         self.assertIsNotNone(candidate.request_block_ids)
+        self.assertIsNone(candidate.request_masks)
         self.assertIsNone(baseline.request_block_ids)
-        for blocks, mask, expected in zip(
+        for blocks, expected in zip(
             candidate.request_block_ids,
-            candidate.request_masks,
             baseline.request_masks,
         ):
-            torch.testing.assert_close(mask, expected)
             torch.testing.assert_close(
-                self._expand_candidate_blocks_reference(blocks, mask.shape[1]), mask
+                self._expand_candidate_blocks_reference(blocks, expected.shape[1]), expected
             )
-        self.assertEqual(tuple(candidate.request_masks[1].shape), (0, 0))
         self.assertEqual(tuple(candidate.request_block_ids[1].shape), (0, 0))
         self.assertTrue(torch.isneginf(logits[0, 10:65537]).all())
         self.assertEqual((candidate.request_block_ids[0][0] >= 0).sum().item(), 2)
         last_block = (lc_per_req[2] - 1) // 8
         self.assertTrue((candidate.request_block_ids[2][0] == last_block).any())
-        self.assertTrue(candidate.request_masks[2][0, -3:].all())
+        self.assertTrue(baseline.request_masks[2][0, -3:].all())
 
-    def test_candidate_publisher_respects_enable_and_performance_cutoff(self):
-        cases = (
-            ([65537, 0, 65539], None, True),
-            ([65537, 0, 65539], False, False),
-            ([65537, 0, 65539], "invalid", False),
-            ([65537, 0, 65539], "true", False),
-            ([65537, 0, 65539], "2", False),
-            ([65537, 0, 65539], "", False),
-            ([4096, 0, 8192], True, False),
-            ([4096, 0, 8192], None, False),
-            ([32768, 0, 32768], True, False),
-            ([32768, 0, 65535], True, False),
-            ([32768, 0, 65536], True, True),
-        )
-        for lengths, enabled, retained in cases:
-            with self.subTest(lengths=lengths, enabled=enabled):
-                candidate, _ = self._publish_candidate_fixture(lengths, enabled)
-                baseline, _ = self._publish_candidate_fixture(lengths, False)
+    def test_candidate_publisher_retains_ids_for_either_sparse_scorer(self):
+        lengths = [17, 0, 11]
+        baseline, _ = self._publish_candidate_fixture(lengths, False)
+        for enabled, paged_sparse, retained in (
+            (None, False, True),
+            (False, True, True),
+            (False, False, False),
+        ):
+            with self.subTest(enabled=enabled, paged_sparse=paged_sparse):
+                candidate, _ = self._publish_candidate_fixture(
+                    lengths, enabled, paged_sparse=paged_sparse
+                )
                 if retained:
-                    self.assertIsNotNone(candidate.request_block_ids)
-                    for blocks, mask in zip(
-                        candidate.request_block_ids, candidate.request_masks
-                    ):
-                        torch.testing.assert_close(
-                            self._expand_candidate_blocks_reference(
-                                blocks, mask.shape[1]
-                            ),
-                            mask,
+                    self.assertIsNone(candidate.request_masks)
+                    masks = [
+                        self._expand_candidate_blocks_reference(
+                            blocks, expected.shape[1]
                         )
+                        for blocks, expected in zip(
+                            candidate.request_block_ids, baseline.request_masks
+                        )
+                    ]
                 else:
                     self.assertIsNone(candidate.request_block_ids)
-                for mask, expected in zip(
-                    candidate.request_masks, baseline.request_masks
-                ):
+                    masks = candidate.request_masks
+                for mask, expected in zip(masks, baseline.request_masks):
                     torch.testing.assert_close(mask, expected)
 
     def test_candidate_publisher_empty_kv_keeps_query_shaped_block_placeholder(self):
         candidate, _ = self._publish_candidate_fixture([0, 0, 65539], True)
-        self.assertEqual(tuple(candidate.request_masks[0].shape), (0, 0))
+        self.assertIsNone(candidate.request_masks)
         self.assertEqual(tuple(candidate.request_block_ids[0].shape), (2, 0))
         self.assertEqual(tuple(candidate.request_block_ids[1].shape), (0, 0))
 

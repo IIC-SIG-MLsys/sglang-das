@@ -349,6 +349,53 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
         self.tm.abort_request.assert_called_once_with(self.state.obj.rid)
 
 
+class TestStreamingAbortTask(CustomTestCase):
+    def test_cleanup_does_not_abort_reused_batch_rid(self):
+        async def drive():
+            tm = _make_tokenizer_manager(self)
+            tm._dispatch_to_scheduler = Mock()
+            obj = GenerateReqInput(
+                text=["finished", "running"], rid=["reused", "running"], stream=True
+            )
+            cleanup = tm.create_abort_task(obj)
+            obj.normalize_batch_and_arguments()
+            tm._init_req_state(obj)
+
+            async def finish_and_reuse_rid(_):
+                tm._handle_abort_req(_make_abort_req("reused"))
+                replacement = GenerateReqInput(text="replacement", rid="reused")
+                replacement.normalize_batch_and_arguments()
+                tm._init_req_state(replacement)
+
+            with patch("asyncio.sleep", side_effect=finish_and_reuse_rid):
+                await cleanup()
+
+            self.assertFalse(tm.rid_to_state["reused"].abort_sent)
+            self.assertTrue(tm.rid_to_state["running"].abort_sent)
+
+        asyncio.run(drive())
+
+    def test_cleanup_from_rejected_duplicate_preserves_admitted_request(self):
+        async def drive():
+            tm = _make_tokenizer_manager(self)
+            tm._dispatch_to_scheduler = Mock()
+            admitted = GenerateReqInput(text="admitted", rid="same", stream=True)
+            admitted.normalize_batch_and_arguments()
+            tm._init_req_state(admitted)
+
+            duplicate = GenerateReqInput(text="duplicate", rid="same", stream=True)
+            cleanup = tm.create_abort_task(duplicate)
+            duplicate.normalize_batch_and_arguments()
+            with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
+                tm._init_req_state(duplicate)
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                await cleanup()
+
+            self.assertFalse(tm.rid_to_state["same"].abort_sent)
+
+        asyncio.run(drive())
+
+
 class TestRidToStateCleanupOnAbort(CustomTestCase):
     """Test that _handle_abort_req removes rid from rid_to_state."""
 

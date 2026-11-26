@@ -6,8 +6,7 @@ from typing import List, Optional, Union
 
 import msgspec
 
-_SSE_DATA_B = b"data: "
-_SSE_NL_B = b"\n\n"
+from sglang.srt.utils.json_response import format_sse_json
 
 
 class StreamDelta(msgspec.Struct, omit_defaults=True):
@@ -96,4 +95,4 @@ def build_sse_content(
         choices=[choice],
         usage=usage,
     )
-    return (_SSE_DATA_B + _stream_encoder.encode(chunk) + _SSE_NL_B).decode()
+    return format_sse_json(_stream_encoder.encode(chunk)).decode()
