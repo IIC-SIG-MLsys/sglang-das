@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+import os
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -27,6 +28,7 @@ _W8A8_SMALL_M_AUTOTUNE_CACHE: Dict[
     Tuple[Optional[int], int, int, int, torch.dtype], Tuple[str, int]
 ] = {}
 _W8A8_FAILED_STATIC_KEYS: set = set()
+_W8A8_FAILED_CONFIG_KEYS: set = set()
 _W8A8_DEVICE_ARCH_CACHE: Dict[Optional[int], bool] = {}
 
 # Offline-benchmarked small-M (M <= 64) W8A8 GEMM kernel table for Hygon BW1000
@@ -115,6 +117,35 @@ def _default_w8a8_smooth_asm_tune(m_i: int, n_i: int) -> Optional[int]:
     if m_i <= 64:
         return 9
     return None
+
+
+def w8a8_triton_config(configs, m, n, k):
+    if not configs:
+        return None
+    exact_key = f"{m}_{n}_{k}"
+    if exact_key in configs:
+        return configs[exact_key]
+    if m <= 16:
+        return None
+    if m <= 64:
+        bucket = (m + 3) & -4
+    elif m <= 160:
+        bucket = (m + 7) & -8
+    elif m < 200:
+        bucket = 160
+    elif m < 480:
+        bucket = 256
+    elif m < 960:
+        bucket = 512
+    elif m < 2048:
+        bucket = 1024
+    elif m < 4096:
+        bucket = 2048
+    elif m < 6000:
+        bucket = 4096
+    else:
+        bucket = 8192
+    return configs.get(f"{bucket}_{n}_{k}")
 
 
 def _hcu_w8a8_small_m_static_enabled() -> bool:
@@ -219,6 +250,72 @@ def _run_w8a8_small_m_candidate(
         True,
         tune,
     )
+
+
+def try_configured_w8a8_scaled_mm(a, b, scale_a, scale_b, out_dtype, method):
+    path = os.environ.get("SGLANG_DSV41_INT8_BLASLT_ALGO_CONFIG")
+    if (
+        not path
+        or not _is_hcu
+        or method not in (1, 3)
+        or not a.is_cuda
+        or out_dtype != torch.bfloat16
+        or a.ndim != 2
+        or b.ndim != 2
+        or a.dtype != torch.int8
+        or b.dtype != torch.int8
+        or not a.is_contiguous()
+        or a.device != b.device
+        or a.device != scale_a.device
+        or a.device != scale_b.device
+    ):
+        return None
+    from sglang.kernels.ops.gemm import dsv41_int8
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    if is_batch_invariant_mode_enabled():
+        return None
+    m, k = a.shape
+    weight = b.t() if method == 1 else b
+    n = weight.shape[0]
+    if (
+        not m
+        or k % 4
+        or weight.shape[1] != k
+        or not weight.is_contiguous()
+        or scale_a.numel() != m
+        or scale_b.numel() != n
+        or scale_a.dtype != torch.float32
+        or scale_b.dtype != torch.float32
+        or not scale_a.is_contiguous()
+        or not scale_b.is_contiguous()
+    ):
+        return None
+    selected = dsv41_int8.configured_w8a8_algo(path, a.device, method, m, n, k)
+    if selected is None:
+        return None
+    kind, tune = selected
+    if kind == "hipblaslt":
+        return dsv41_int8.try_w8a8_blaslt(a, weight, scale_a, scale_b, out_dtype, tune)
+    if kind == "smooth_asm" and (k % 256 or not _w8a8_smooth_asm_supported(a.device)):
+        return None
+    key = (a.device, m, n, k, kind, tune)
+    if key in _W8A8_FAILED_CONFIG_KEYS:
+        return None
+    try:
+        out = _run_w8a8_small_m_candidate(
+            kind, tune, a, weight.t(), scale_a, scale_b, out_dtype, m, n, k
+        )
+    except (RuntimeError, ImportError):
+        out = None
+    if (
+        not isinstance(out, torch.Tensor)
+        or out.shape != (m, n)
+        or out.dtype != out_dtype
+    ):
+        _W8A8_FAILED_CONFIG_KEYS.add(key)
+        return None
+    return out
 
 
 def _select_hcu_w8a8_small_m_kernel(
