@@ -11,6 +11,7 @@ from typing import Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hcu
 
 try:
     import triton
@@ -33,8 +34,16 @@ def _log_prefill_candidate_route(route: str) -> None:
 
 
 def prefill_paged_sparse_enabled() -> bool:
-    """Enable the HCU Prefill paged sparse consumer by default."""
-    return envs.SGLANG_HCU_PREFILL_PAGED_SPARSE.get()
+    """Use the HCU Prefill paged sparse consumer unless explicitly overridden or slower on gfx938."""
+    flag = envs.SGLANG_HCU_PREFILL_PAGED_SPARSE
+    enabled = flag.get()
+    if flag.is_set() or not enabled:
+        return enabled
+    if is_hcu() and torch.cuda.is_available():
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        if arch == "gfx938":
+            return False
+    return True
 
 
 if triton is not None:

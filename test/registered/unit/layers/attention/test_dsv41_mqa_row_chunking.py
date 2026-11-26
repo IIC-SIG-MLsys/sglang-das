@@ -266,7 +266,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
         if raw is not None:
             raw.copy_(torch.where(valid, chosen - ks[:, None], -1))
 
-    def run_chunked(self, step, candidate_blocks=None, raw=True):
+    def run_chunked(self, step, candidate_blocks=None, raw=True, **kwargs):
         self.previous = None
         pages = torch.full((12, 3), -1, dtype=torch.int32)
         indices = torch.full_like(pages, -1) if raw else None
@@ -286,6 +286,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
             indices,
             candidate_blocks,
             step,
+            **kwargs,
         )
         return pages, indices
 
@@ -360,6 +361,22 @@ class TestDSV41MQARowChunking(CustomTestCase):
                 )
                 torch.testing.assert_close(got, expected)
             offset += count
+
+    def test_chunked_source_publishes_only_the_folded_request_suffixes(self):
+        self.indexer.is_candidate_source = True
+        full_topk = self.run_chunked(2)
+        full = self.owner.forward_metadata.candidate_metadata.request_block_ids
+        tail = SimpleNamespace(candidate_metadata=None)
+        tail_lens = [2, 0, 1, 0]
+        tail_topk = self.run_chunked(2, tail_target=(tail, tail_lens))
+        for got, expected in zip(tail_topk, full_topk):
+            torch.testing.assert_close(got, expected)
+        self.assertIsNone(self.owner.forward_metadata.candidate_metadata)
+        self.assertIsNone(tail.candidate_metadata.request_masks)
+        for ids, all_ids, n in zip(
+            tail.candidate_metadata.request_block_ids, full, tail_lens
+        ):
+            torch.testing.assert_close(ids, all_ids[all_ids.shape[0] - n :])
 
     def test_compact_topk_preserves_ragged_positions_ties_and_slot_mapping(self):
         ns = dict(
@@ -630,6 +647,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
         self.owner.token_to_kv_pool.get_low_ratio_index_k_fp4 = (
             lambda *args, **kwargs: (self.k, torch.ones(23))
         )
+        self.owner.fuse_indexer_q_prep = False
         self.owner._hcu_prefill_candidate_blocks = lambda *args: None
         self.owner._low_ratio_index_topk_chunked = types.MethodType(
             self.ns["_low_ratio_index_topk_chunked"], self.owner
@@ -702,6 +720,46 @@ class TestDSV41MQARowChunking(CustomTestCase):
                 for got, want in zip((pages, raw), self.expected()):
                     torch.testing.assert_close(got, want)
 
+        # A covered source and a skipped decoder tail can both enter fused TopK.
+        # The full and tail metadata may still hold IDs from the previous source.
+        self.indexer.is_candidate_source = True
+        decisions = []
+
+        def fused(*args, skip_candidate_op, tail_target):
+            decisions.append((skip_candidate_op, tail_target))
+            return True
+
+        self.owner._try_low_ratio_index_topk_fused = fused
+        with (
+            patch.dict(sys.modules, {quant.__name__: quant}),
+            patch.dict(
+                os.environ, {"SGLANG_HCU_OPT_DSV41_PREFILL_CONSUMER_40352": "1"}
+            ),
+            envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA.override(True),
+            patch.object(torch.Tensor, "is_cuda", True),
+        ):
+            for block_count, skip_late in ((8, False), (2, True)):
+                self.indexer.candidate_topk_blocks = block_count
+                self.owner.skip_late_layers = skip_late
+                self.owner.tail_forward_metadata = SimpleNamespace(
+                    candidate_metadata=object()
+                )
+                self.owner.forward_metadata.candidate_metadata = object()
+                batch.forward_mode = Mode.EXTEND
+                self.ns["_low_ratio_index_topk_dense"](
+                    self.owner,
+                    layer,
+                    q_padded,
+                    q_padded,
+                    pos,
+                    batch,
+                    q_lens,
+                    self.counts,
+                )
+                self.assertIsNone(self.owner.forward_metadata.candidate_metadata)
+                self.assertIsNone(self.owner.tail_forward_metadata.candidate_metadata)
+        self.assertEqual(decisions, [(True, None), (True, None)])
+
     def test_fused_source_slices_request_k_and_keeps_padding(self):
         match = self.ns
         load_functions(
@@ -728,13 +786,17 @@ class TestDSV41MQARowChunking(CustomTestCase):
         pages = torch.full((12, 512), -1, dtype=torch.int32)
         raw = torch.full_like(pages, -1)
         observed = []
+        publication = []
 
         def fused(q, kv, weights, lengths, *, offsets, publish_blocks):
-            self.assertTrue(publish_blocks)
+            publication.extend([publish_blocks] * q.shape[0])
             observed.append((kv[0][0, 0].item(), kv[0].shape[0], q.shape[0]))
             tokens = torch.full((q.shape[0], 512), -1, dtype=torch.int32)
             tokens[:, 0] = offsets
-            return tokens, torch.zeros((q.shape[0], 2048), dtype=torch.int32)
+            blocks = (
+                lengths[:, None].expand(-1, 2048).clone() if publish_blocks else None
+            )
+            return tokens, blocks
 
         def finish(selected, slots, starts, out_pages, out_raw):
             out_pages[:, 0] = slots[selected[:, 0].long()]
@@ -804,6 +866,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
         self.assertEqual(
             observed, [(0, 11, 2), (0, 11, 2), (0, 11, 1), (14, 9, 2), (14, 9, 1)]
         )
+        self.assertEqual(publication, [True] * 8)
         ids = self.owner.forward_metadata.candidate_metadata.request_block_ids
         self.assertEqual(
             [tensor.shape for tensor in ids], [(5, 2048), (0, 0), (3, 2048), (1, 0)]
@@ -812,6 +875,37 @@ class TestDSV41MQARowChunking(CustomTestCase):
         self.assertTrue((pages[8:] == -1).all())
         self.assertTrue((raw[:8, 0] == 0).all())
         self.assertTrue((raw[8:] == -1).all())
+
+        tail = SimpleNamespace(candidate_metadata=None)
+        with (
+            patch.dict(sys.modules, modules),
+            envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_SOURCE_MIN_K.override(9),
+            envs.SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS.override(True),
+        ):
+            publication.clear()
+            self.assertTrue(
+                match["_try_low_ratio_index_topk_fused"](
+                    *args, tail_target=(tail, [3, 0, 1, 0])
+                )
+            )
+            self.assertEqual(
+                publication, [False, False, True, True, True, False, False, True]
+            )
+            self.assertIsNone(self.owner.forward_metadata.candidate_metadata)
+            self.assertIsNone(tail.candidate_metadata.request_masks)
+            for got, all_ids, count in zip(
+                tail.candidate_metadata.request_block_ids, ids, [3, 0, 1, 0]
+            ):
+                torch.testing.assert_close(got, all_ids[all_ids.shape[0] - count :])
+            publication.clear()
+            self.assertTrue(
+                match["_try_low_ratio_index_topk_fused"](*args, skip_candidate_op=True)
+            )
+            self.assertEqual(publication, [False] * 8)
+            self.assertIsNone(self.owner.forward_metadata.candidate_metadata)
+            torch.testing.assert_close(
+                pages[:8, 0], self.slots[self.ks[:8].long()].int()
+            )
 
     def test_bounded_replay_tail_carries_compact_ids_including_empty_rank_rows(self):
         blocks = [

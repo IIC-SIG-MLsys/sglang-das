@@ -48,12 +48,35 @@ class TestInt8KernelBridge(CustomTestCase):
             result.copy_(raw * input_scale * weight_scale.T)
 
         ops = types.SimpleNamespace(gemm_out=gemm, scale_out=scale)
-        with patch.object(dsv41_int8, "load_native", return_value=ops):
-            actual = dsv41_int8._project_unpacked(
-                x, weight, ws, 1, 1, input_quant_args=(q, xs), algo_rank=0
-            )
         expected = torch.tensor([[[1.5]], [[-3.5]]], dtype=x.dtype)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        with (
+            patch.object(dsv41_int8, "load_native", return_value=ops),
+            dsv41_int8.envs.SGLANG_DSV41_INT8_SERVICE_OPT.override(False),
+        ):
+            for project in (dsv41_int8._project_unpacked, dsv41_int8.project):
+                actual = project(
+                    x, weight, ws, 1, 1, input_quant_args=(q, xs), algo_rank=0
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_invalid_projection_is_rejected_before_loading_native_ops(self):
+        x = torch.zeros(2, 1, 4, dtype=torch.bfloat16)
+        w = torch.ones(4, 4, dtype=torch.int8)
+        s = torch.ones(4, 1)
+        with patch.object(dsv41_int8, "load_native", side_effect=AssertionError):
+            for packed in (False, True):
+                with dsv41_int8.envs.SGLANG_DSV41_INT8_SERVICE_OPT.override(packed):
+                    for project in (dsv41_int8._project_unpacked, dsv41_int8.project):
+                        for a, b, scale, dtype in (
+                            (x[:, 0], w, s, x.dtype),
+                            (x, w.t(), s, x.dtype),
+                            (x, w, s[:1], x.dtype),
+                            (x, w, s.half(), x.dtype),
+                            (x.to(torch.int8), w, s, x.dtype),
+                            (x, w, s, torch.int32),
+                        ):
+                            with self.assertRaises(ValueError):
+                                project(a, b, scale, 1, 4, output_dtype=dtype)
 
     def test_inverse_rope_projection_respects_fast_path_gates(self):
         minimum = dsv41_int8._TRITON_QUANT_MIN_ELEMENTS

@@ -564,7 +564,6 @@ def _rmsnorm_per_token_quant_row(
     stride_qm,
     eps,
     Q_MAX: tl.constexpr,
-    MIN_SCALE: tl.constexpr,
     INT8: tl.constexpr,
     CHUNK: tl.constexpr,
     NUM_CHUNKS: tl.constexpr,
@@ -600,7 +599,9 @@ def _rmsnorm_per_token_quant_row(
         scale = row_amax / Q_MAX
         inv_scale = Q_MAX / row_amax
     else:
-        scale = tl.maximum(row_amax / Q_MAX, MIN_SCALE)
+        # Match the native FP8 consumer: zero scale for zero rows, no floor.
+        scale = row_amax / Q_MAX
+        inv_scale = tl.where(row_amax == 0.0, 0.0, Q_MAX / row_amax)
     tl.store(out_scale_ptr + row, scale)
 
     # quantize the stored bf16 row itself; the barrier makes every thread's stores visible
@@ -610,9 +611,11 @@ def _rmsnorm_per_token_quant_row(
         mask = offs < K
         y = tl.load(n_row + offs, mask=mask, other=0.0).to(tl.float32)
         if INT8:
-            q = libdevice.round(y * inv_scale)
+            # Match the native per-token quantizer at positive and negative ties.
+            q = libdevice.nearbyint(y * inv_scale)
         else:
-            q = tl.clamp(y / scale, -Q_MAX, Q_MAX)
+            # Multiply by the same reciprocal as native per-token quantization.
+            q = y * inv_scale
         tl.store(
             out_q_ptr + row * stride_qm + offs,
             q.to(out_q_ptr.dtype.element_ty),
@@ -645,7 +648,6 @@ def _rmsnorm_per_token_quant_sinkhorn_kernel(
     inv_k,
     rms_eps,
     Q_MAX: tl.constexpr,
-    MIN_SCALE: tl.constexpr,
     INT8: tl.constexpr,
     CHUNK: tl.constexpr,
     NUM_CHUNKS: tl.constexpr,
@@ -672,7 +674,6 @@ def _rmsnorm_per_token_quant_sinkhorn_kernel(
             stride_qm,
             eps,
             Q_MAX=Q_MAX,
-            MIN_SCALE=MIN_SCALE,
             INT8=INT8,
             CHUNK=CHUNK,
             NUM_CHUNKS=NUM_CHUNKS,
@@ -707,8 +708,9 @@ def rmsnorm_per_token_fp8_with_sinkhorn(
     coefficients: HcCoefficients,
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.dtype], torch.Tensor]:
     """rmsnorm_with_sinkhorn(..., fake_quant=False) that also emits the norm's per-token fp8
-    operand ``(q [M, K], scale [M, 1] fp32, x.dtype)``; returns (operand, norm)."""
-    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, fp8_max
+    operand ``(q [M, K], scale [M, 1] fp32, x.dtype)`` with native per-token
+    scale and reciprocal semantics; returns (operand, norm)."""
+    from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
     q, scale, out_norm = _rmsnorm_per_token_quant_with_sinkhorn(
         x,
@@ -716,9 +718,7 @@ def rmsnorm_per_token_fp8_with_sinkhorn(
         eps,
         coefficients,
         q_dtype=fp8_dtype,
-        q_max=float(fp8_max),
-        # the floor vLLM's dynamic per-token fp8 quant uses; keeps all-zero rows finite
-        min_scale=1.0 / (float(fp8_max) * 512.0),
+        q_max=float(torch.finfo(fp8_dtype).max),
     )
     return (q, scale, x.dtype), out_norm
 
@@ -737,8 +737,7 @@ def rmsnorm_per_token_int8_with_sinkhorn(
         eps,
         coefficients,
         q_dtype=torch.int8,
-        q_max=127.0,
-        min_scale=0.0,
+        q_max=float(torch.iinfo(torch.int8).max),
     )
     return (q, scale), out_norm
 
@@ -751,7 +750,6 @@ def _rmsnorm_per_token_quant_with_sinkhorn(
     *,
     q_dtype: torch.dtype,
     q_max: float,
-    min_scale: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.shape[-1] % 32 == 0, x.shape
     assert weight.dim() == 1 and weight.shape[0] == x.shape[-1], weight.shape
@@ -795,7 +793,6 @@ def _rmsnorm_per_token_quant_with_sinkhorn(
         1.0 / coefficients.k,
         coefficients.rms_eps,
         Q_MAX=q_max,
-        MIN_SCALE=min_scale,
         INT8=q_dtype == torch.int8,
         CHUNK=CHUNK,
         NUM_CHUNKS=triton.cdiv(K, CHUNK),

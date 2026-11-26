@@ -200,7 +200,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.sglang_kvalloc_kernel = _is_hcu and get_bool_env_var(
             "SGLANG_KVALLOC_KERNEL", default="true"
         )
-        self.lightop_kvalloc_kernel = envs.SGLANG_LIGHTOP_KVALLOC_KERNEL.get()
+        lightop_flag = envs.SGLANG_LIGHTOP_KVALLOC_KERNEL
+        self.lightop_kvalloc_kernel = lightop_flag.get()
+        self.prefer_lightop_kvalloc_kernel = (
+            lightop_flag.is_set() and self.lightop_kvalloc_kernel
+        )
         self.seen_max_num_extend_tokens_next_power_of_2 = 1
         self.use_triton_kernels = current_platform.capabilities.supports_triton
 
@@ -291,23 +295,26 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
+        parallel = self.use_triton_kernels and use_parallel_alloc_extend(
+            prefix_lens, extend_num_tokens
+        )
+        lightop = None
         if (
-            self.use_triton_kernels
-            and not (self.sglang_kvalloc_kernel and self.lightop_kvalloc_kernel)
-            and use_parallel_alloc_extend(prefix_lens, extend_num_tokens)
+            self.sglang_kvalloc_kernel
+            and self.lightop_kvalloc_kernel
+            and 0 < bs <= 64
+            and extend_num_tokens >= bs * 8192
+            and (not parallel or self.prefer_lightop_kvalloc_kernel)
         ):
+            # An explicit LightOp selection takes priority over the specialized
+            # single-request kernel when the installed wheel provides it.
+            lightop = _get_lightop_alloc_extend_kernel()
+        if parallel and lightop is None:
             alloc_extend_single_request(
                 prefix_lens, last_loc, self.free_pages, out_indices, self.page_size
             )
         elif self.sglang_kvalloc_kernel:
-            alloc_extend_kernel_impl = (
-                _get_lightop_alloc_extend_kernel()
-                if self.lightop_kvalloc_kernel
-                else None
-            )
-            if alloc_extend_kernel_impl is None:
-                alloc_extend_kernel_impl = sgl_kernel_alloc_extend_kernel
-
+            alloc_extend_kernel_impl = lightop or sgl_kernel_alloc_extend_kernel
             alloc_extend_kernel_impl(
                 pre_lens_ptr=prefix_lens.to(torch.int64),
                 seq_lens_ptr=seq_lens.to(torch.int64),
