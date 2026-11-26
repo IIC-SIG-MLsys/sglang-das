@@ -79,6 +79,29 @@ def candidate_block_mask(
 
 
 @functools.cache
+def lightop_candidate_table_available() -> bool:
+    modules = _lightop_modules() if _is_hcu else None
+    return modules is not None and hasattr(modules[0], "dsv41_candidate_block_table")
+
+
+def logical_candidate_block_ids(
+    logits: torch.Tensor, seq_lens: torch.Tensor, topk_blocks: int
+) -> torch.Tensor:
+    """Run the same LightOp selector as the mask op, with an identity page map."""
+    block_size = DEFAULT_CANDIDATE_BLOCK_SIZE
+    num_blocks = (logits.size(1) + block_size - 1) // block_size
+    # A stride-zero, one-based identity page map gives logical IDs + 1 at
+    # page_size=8, so the table kernel's zero padding maps directly to -1.
+    page_table = torch.arange(
+        1, num_blocks + 1, device=logits.device, dtype=torch.int32
+    ).expand(logits.size(0), -1)
+    ids, _ = candidate_block_table(
+        logits, seq_lens, page_table, block_size, topk_blocks, block_size
+    )
+    return ids.sub_(1)
+
+
+@functools.cache
 def lightop_paged_indexer_available() -> bool:
     """True when the paged fp4 decode indexer can run on LightOp: HCU, the flag
     on, and a LightOp build providing the paged ABI and the candidate table."""

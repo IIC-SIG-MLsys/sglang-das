@@ -175,6 +175,7 @@ class CacheConfig:
 
     # Model / pool
     kv_size: int = 256
+    swa_kv_size: Optional[int] = None
     max_num_reqs: int = 10
     max_context_len: int = 512
     head_num: int = 2
@@ -681,9 +682,10 @@ def build_fixture(
         )
 
     if cfg.has_swa:
+        swa_kv_size = cfg.kv_size if cfg.swa_kv_size is None else cfg.swa_kv_size
         kv_pool = SWAKVPool(
             size=cfg.kv_size,
-            size_swa=cfg.kv_size,
+            size_swa=swa_kv_size,
             page_size=cfg.page_size,
             dtype=cfg.dtype,
             head_num=cfg.head_num,
@@ -697,7 +699,7 @@ def build_fixture(
         with envs.SGLANG_DEBUG_MEMORY_POOL.override(True):
             allocator = SWATokenToKVPoolAllocator(
                 size=cfg.kv_size,
-                size_swa=cfg.kv_size,
+                size_swa=swa_kv_size,
                 page_size=cfg.page_size,
                 dtype=cfg.dtype,
                 device=device,
@@ -13314,88 +13316,278 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         cache.prefetch_from_storage.assert_not_called()
 
     def test_pd_prefill_checkpoint_does_not_recycle_queued_private_pages(self):
-        """When PD prefill has already queued private pages for async transfer
-        (start_send_idx > cache_protected_len), a later live checkpoint must
-        not deduplicate and free those pages until is_finished=True."""
-        from types import SimpleNamespace
-
-        cfg = CacheConfig(
-            components=(ComponentType.FULL, ComponentType.SWA),
-            page_size=256,
-            sliding_window_size=128,
-            kv_size=2048,
-            max_context_len=1024,
-            decoder_swa_bounded_replay=True,
-            swa_gates_prefix_match=True,
-        )
-        cache, allocator, pool = build_fixture(cfg)
+        """Armed and queued PD sends keep private FULL pages and available reuse SWA."""
+        page_size = 256
         prompt = list(range(1, 633))
-        canonical_p0 = self._alloc_paged(allocator, 256)
-        self.assertIsNotNone(canonical_p0)
-        cache.insert(
-            InsertParams(
-                key=RadixKey(array("q", prompt[:256])),
-                value=canonical_p0.clone(),
-            )
-        )
+        # Three pages require reclaiming Page 0 for continuation. Eight can
+        # preserve it as the reuse window, while Page 1 serves active attention.
+        for swa_kv_size, reclaimed in ((768, page_size), (2048, 0)):
+            with self.subTest(swa_kv_size=swa_kv_size):
+                cfg = CacheConfig(
+                    components=(ComponentType.FULL, ComponentType.SWA),
+                    page_size=page_size,
+                    sliding_window_size=128,
+                    kv_size=2048,
+                    swa_kv_size=swa_kv_size,
+                    max_context_len=1024,
+                    decoder_swa_bounded_replay=True,
+                )
+                cache, allocator, pool = build_fixture(cfg)
+                canonical_p0 = self._alloc_paged(allocator, page_size)
+                self.assertIsNotNone(canonical_p0)
+                cache.insert(
+                    InsertParams(
+                        key=RadixKey(array("q", prompt[:page_size])),
+                        value=canonical_p0.clone(),
+                    )
+                )
 
+                req = Req(
+                    rid="pd-chunked-sender",
+                    origin_input_text="",
+                    origin_input_ids=array("q", prompt),
+                    sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+                    return_logprob=True,
+                )
+                req.logprob_start_len = page_size
+                req.init_next_round_input(cache)
+                self.assertEqual(req.prefix_len, 0)
+                req.lock = cache.lock(req.last_node)
+                self.assertIsNotNone(pool.alloc([req]))
+                req.disagg_kv_sender = object()
+
+                p0_private = self._alloc_paged(allocator, page_size)
+                self.assertIsNotNone(p0_private)
+                self.assertFalse(torch.equal(p0_private, canonical_p0))
+                pool.write((req.kv.req_pool_idx, slice(0, page_size)), p0_private)
+                req.kv.kv_allocated_len = req.kv.kv_committed_len = page_size
+                req.extend_end = page_size
+                checkpoint_kv_cache(req, cache)
+
+                chunk_end = 2 * page_size
+                p1_private = self._alloc_paged(allocator, page_size)
+                self.assertIsNotNone(p1_private)
+                pool.write(
+                    (req.kv.req_pool_idx, slice(page_size, chunk_end)), p1_private
+                )
+                req.kv.kv_allocated_len = req.kv.kv_committed_len = chunk_end
+                req.extend_end = chunk_end
+                req.swa_branching_seqlen = page_size
+                row = pool.req_to_token[req.kv.req_pool_idx]
+                private_full = row[:chunk_end].clone()
+                swa_mapping = allocator.full_to_swa_index_mapping
+                private_swa = swa_mapping[private_full.long()]
+                self.assertTrue((private_swa > 0).all())
+                free_full_before = allocator.full_available_size()
+                free_swa_before = allocator.swa_available_size()
+
+                # First only the overlap send is armed, then only the queued
+                # send protects Page 0. Each guard must independently block dedup.
+                for start_send_idx, tmp_end_idx in ((0, page_size), (page_size, -1)):
+                    with self.subTest(start_send_idx=start_send_idx):
+                        req.start_send_idx = start_send_idx
+                        req.tmp_end_idx = tmp_end_idx
+                        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(
+                            True
+                        ):
+                            checkpoint_kv_cache(req, cache)
+                        self.assertEqual(req.kv.cache_protected_len, 0)
+                        self.assertEqual(
+                            allocator.full_available_size(), free_full_before
+                        )
+                        torch.testing.assert_close(row[:chunk_end], private_full)
+                        self.assertEqual(
+                            allocator.swa_available_size(), free_swa_before + reclaimed
+                        )
+                        self.assertEqual(
+                            req.kv.get_evicted_seqlen(ComponentType.SWA), reclaimed
+                        )
+                        mapped = swa_mapping[private_full.long()]
+                        self.assertTrue((mapped[:reclaimed] == 0).all())
+                        torch.testing.assert_close(
+                            mapped[reclaimed:], private_swa[reclaimed:]
+                        )
+
+                budget = allocator.create_prefill_budget(cache)
+                self.assertGreaterEqual(
+                    budget.available_chunk_tokens(page_size, prefix_len=chunk_end),
+                    len(prompt) - chunk_end,
+                )
+
+                final_slots = self._alloc_paged(allocator, len(prompt) - chunk_end)
+                self.assertIsNotNone(final_slots)
+                pool.write(
+                    (req.kv.req_pool_idx, slice(chunk_end, len(prompt))), final_slots
+                )
+                req.kv.kv_allocated_len = req.kv.kv_committed_len = len(prompt)
+                req.extend_end = len(prompt)
+                req.finished_reason = FINISH_LENGTH(length=0)
+                release_kv_cache(req, cache, checkpoint=True)
+                cache.sanity_check()
+                cache.evict(EvictParams(num_tokens=allocator.size_full))
+                self.assertEqual(allocator.full_available_size(), allocator.size_full)
+                self.assertEqual(allocator.swa_available_size(), allocator.size_swa)
+
+    def _finish_chunked_prefill(
+        self, cache, allocator, pool, prompt, chunk_size, *, mode
+    ):
+        """Run cache checkpoints with real paged allocations and simulated PD sends."""
         req = Req(
-            rid="pd-chunked-sender",
+            rid="chunked-swa-producer",
             origin_input_text="",
             origin_input_ids=array("q", prompt),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
-            return_logprob=True,
         )
-        req.logprob_start_len = 256
         req.init_next_round_input(cache)
-        req.lock = cache.lock(req.last_node)
+        self.assertEqual(req.prefix_len, 0)
         self.assertIsNotNone(pool.alloc([req]))
+        req.lock = cache.lock(req.last_node)
+        if mode == "pd":
+            req.disagg_kv_sender = object()
 
-        # Chunk 1 [0..256): kept private at checkpoint, then queued for Mooncake.
-        p0_private = self._alloc_paged(allocator, 256)
-        self.assertIsNotNone(p0_private)
-        pool.write((req.kv.req_pool_idx, slice(0, 256)), p0_private)
-        req.kv.kv_allocated_len = 256
-        req.kv.kv_committed_len = 256
-        req.extend_end = 256
-        req.disagg_kv_sender = SimpleNamespace()
-        checkpoint_kv_cache(req, cache)
-        req.start_send_idx = 256
+        peak_swa = 0
+        row = pool.req_to_token[req.kv.req_pool_idx]
+        window = cache.sliding_window_size
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            for start in range(0, len(prompt), chunk_size):
+                end = min(start + chunk_size, len(prompt))
+                budget = allocator.create_prefill_budget(cache)
+                self.assertGreaterEqual(
+                    budget.available_chunk_tokens(chunk_size, prefix_len=start),
+                    end - start,
+                )
+                allocator.evict_to_free_tokens(cache, end - start)
+                slots = self._alloc_paged(allocator, end - start)
+                self.assertIsNotNone(slots)
+                pool.write((req.kv.req_pool_idx, slice(start, end)), slots)
+                req.kv.kv_allocated_len = end
+                req.kv.kv_committed_len = end
+                req.extend_end = end
+                peak_swa = max(
+                    peak_swa, allocator.size_swa - allocator.swa_available_size()
+                )
 
-        # Chunk 2 [256..512): because start_send_idx=256 > cache_protected_len=0,
-        # p0_private FULL must stay owned by req (not deduped/freed back to
-        # allocator), while Page 0's out-of-window private SWA is reclaimed so
-        # a small SWA pool cannot strand a lone prefill.
-        p1_private = self._alloc_paged(allocator, 256)
-        self.assertIsNotNone(p1_private)
-        pool.write((req.kv.req_pool_idx, slice(256, 512)), p1_private)
-        req.kv.kv_allocated_len = 512
-        req.kv.kv_committed_len = 512
-        req.extend_end = 512
-        req.swa_branching_seqlen = 256
-        free_full_before = allocator.full_available_size()
-        free_swa_before = allocator.swa_available_size()
-        checkpoint_kv_cache(req, cache)
-        self.assertEqual(req.kv.cache_protected_len, 0)
-        self.assertEqual(allocator.full_available_size(), free_full_before)
-        self.assertEqual(allocator.swa_available_size(), free_swa_before + 256)
-        self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), 256)
-        torch.testing.assert_close(
-            pool.req_to_token[req.kv.req_pool_idx, :256].to(torch.int64),
-            p0_private.to(torch.int64),
-        )
+                protected_before = req.kv.cache_protected_len
+                full_free_before = allocator.full_available_size()
+                pending_end = max(req.start_send_idx, req.tmp_end_idx)
+                queued = row[protected_before:pending_end].clone()
+                if mode == "unpublished":
+                    cache.advance_unpublished_req(req)
+                    req.prefix_len = end
+                else:
+                    # PD does this even for the final forward, before sending SWA.
+                    checkpoint_kv_cache(req, cache)
+                if mode == "unpublished" or pending_end > protected_before:
+                    self.assertEqual(req.kv.cache_protected_len, protected_before)
+                    self.assertEqual(allocator.full_available_size(), full_free_before)
+                    torch.testing.assert_close(
+                        row[protected_before:pending_end], queued
+                    )
 
-        # Once transfer completes (is_finished=True), release_kv_cache publishes
-        # and frees cleanly with zero leaks.
-        p2_private = self._alloc_paged(allocator, 120)
-        self.assertIsNotNone(p2_private)
-        pool.write((req.kv.req_pool_idx, slice(512, 632)), p2_private)
-        req.kv.kv_allocated_len = 632
-        req.kv.kv_committed_len = 632
-        req.extend_end = 632
+                # The next forward or final PD send must still have its own window.
+                active = row[max(0, end - window) : end].long()
+                self.assertTrue((allocator.full_to_swa_index_mapping[active] > 0).all())
+                self.assertEqual(cache.swa_protected_size(), 0)
+                if mode == "pd":
+                    if start == 0:
+                        req.tmp_end_idx = end
+                    else:
+                        req.tmp_end_idx = -1
+                        req.start_send_idx = end
+
         req.finished_reason = FINISH_LENGTH(length=0)
         release_kv_cache(req, cache, checkpoint=True)
         cache.sanity_check()
+        return peak_swa
+
+    def test_chunked_pd_hbm_hit_on_first_repeat(self):
+        """The final PD checkpoint must preserve the window behind the shorter hit."""
+        page_size, window, chunk_size = 256, 128, 32768
+        for prime_len, hit_len, expected in (
+            (131329, 131073, 130816),
+            (409856, 409600, 409344),
+        ):
+            with self.subTest(prime_len=prime_len):
+                cfg = CacheConfig(
+                    components=(ComponentType.FULL, ComponentType.SWA),
+                    page_size=page_size,
+                    sliding_window_size=window,
+                    decoder_swa_bounded_replay=True,
+                    kv_size=(prime_len // page_size + 2) * page_size,
+                    swa_kv_size=chunk_size + 4 * page_size,
+                    max_context_len=prime_len,
+                    max_num_reqs=1,
+                    num_layers=2,
+                    full_attention_layer_ids=(0,),
+                    head_num=1,
+                    head_dim=8,
+                )
+                cache, allocator, pool = build_fixture(cfg)
+                tokens = list(range(prime_len))
+                peak_swa = self._finish_chunked_prefill(
+                    cache, allocator, pool, tokens, chunk_size, mode="pd"
+                )
+
+                self.assertEqual(self._matched_len(cache, tokens[:hit_len]), expected)
+                self.assertLessEqual(peak_swa, chunk_size + 3 * page_size)
+
+                # Divergence in a reclaimed chunk can see the FULL path but
+                # cannot reuse a boundary whose trailing SWA is a tombstone.
+                middle = 2 * chunk_size
+                divergent = tokens[:middle] + [prime_len] * page_size
+                self.assertEqual(
+                    self._matched_len(cache, divergent), chunk_size - page_size
+                )
+                self.assertEqual(
+                    self._matched_len(
+                        cache,
+                        tokens[:hit_len],
+                        return_logprob=True,
+                        logprob_start_len=expected,
+                    ),
+                    0,
+                )
+                cache.evict(EvictParams(num_tokens=allocator.size_full))
+                self.assertEqual(allocator.full_available_size(), allocator.size_full)
+                self.assertEqual(allocator.swa_available_size(), allocator.size_swa)
+                self.assertEqual(pool.available_size(), cfg.max_num_reqs)
+
+    def test_chunked_prefill_short_append_reuses_tail(self):
+        """A completed turn still matches just behind its tail after a short append."""
+        page_size, window, chunk_size = 256, 128, 1024
+        cfg = CacheConfig(
+            components=(ComponentType.FULL, ComponentType.SWA),
+            page_size=page_size,
+            sliding_window_size=window,
+            decoder_swa_bounded_replay=True,
+            kv_size=4864,
+            swa_kv_size=2048,
+            max_context_len=4864,
+            num_layers=2,
+            full_attention_layer_ids=(0,),
+        )
+        for mode in ("pd", "unpublished", "unified"):
+            for turn1_len in (4096, 4097, 4225):
+                with self.subTest(mode=mode, turn1_len=turn1_len):
+                    cache, allocator, pool = build_fixture(cfg)
+                    tokens = list(range(turn1_len + 512))
+                    self._finish_chunked_prefill(
+                        cache,
+                        allocator,
+                        pool,
+                        tokens[:turn1_len],
+                        chunk_size,
+                        mode=mode,
+                    )
+
+                    for append in (1, 50, 256, 512):
+                        turn2_len = turn1_len + append
+                        expected = min(turn1_len, turn2_len - window)
+                        expected = expected // page_size * page_size
+                        with self.subTest(append=append):
+                            self.assertEqual(
+                                self._matched_len(cache, tokens[:turn2_len]), expected
+                            )
 
     def test_dsv4_decode_donation_preserves_active_swa_and_avoids_leak_on_overlap(
         self,
@@ -14195,13 +14387,14 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         self.assertIsNone(m_req.kv.mamba_cow_src_index)
         self.assertTrue(m_req.kv.mamba_needs_clear)
 
-        # 7) EAGLE PD send reclamation frees Page 0 at token boundary 256
-        # (page=128, window=128, 3 SWA pages) instead of stranding at 255.
+        # 7) With three SWA pages, EAGLE PD must reclaim Page 0 when the
+        # raw forward length advances from 255 to 256 tokens.
         eagle_pd_cfg = CacheConfig(
             components=(ComponentType.FULL, ComponentType.SWA),
             page_size=128,
             sliding_window_size=128,
             kv_size=1024,
+            swa_kv_size=384,
             max_context_len=1024,
             is_eagle=True,
             decoder_swa_bounded_replay=True,
@@ -14221,12 +14414,16 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(CustomTestCase):
         self.assertIsNotNone(ep_slots)
         ep_pool.write((ep_req.kv.req_pool_idx, slice(0, 256)), ep_slots)
         ep_req.kv.kv_allocated_len = 256
-        ep_req.kv.kv_committed_len = 256
-        ep_req.extend_end = 256
         ep_req.disagg_kv_sender = SimpleNamespace()
         ep_req.start_send_idx = 128
         swa_before = ep_alloc.swa_available_size()
-        checkpoint_kv_cache(ep_req, ep_cache)
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            ep_req.kv.kv_committed_len = ep_req.extend_end = 255
+            checkpoint_kv_cache(ep_req, ep_cache)
+            self.assertEqual(ep_alloc.swa_available_size(), swa_before)
+
+            ep_req.kv.kv_committed_len = ep_req.extend_end = 256
+            checkpoint_kv_cache(ep_req, ep_cache)
         self.assertEqual(ep_alloc.swa_available_size(), swa_before + 128)
         self.assertEqual(ep_req.kv.get_evicted_seqlen(ComponentType.SWA), 128)
         ep_req.finished_reason = FINISH_LENGTH(length=0)

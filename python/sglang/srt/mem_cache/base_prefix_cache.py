@@ -685,6 +685,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Slide request-owned windows at the scheduler's safe eviction frontier."""
         from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 
+        shares_prefix = self.supports_prefix_sharing()
         free_swa_out_of_window_slots(
             req,
             pre_len,
@@ -692,8 +693,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             page_size=self.page_size,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            supports_prefix_sharing=self.supports_prefix_sharing(),
-            retain_floor=self.swa_retain_floor(req),
+            supports_prefix_sharing=shares_prefix,
+            retain_floor=self.swa_retain_floor(req) if shares_prefix else None,
             eviction_interval=eviction_interval,
         )
 

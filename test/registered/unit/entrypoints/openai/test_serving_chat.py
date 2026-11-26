@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 from unittest.mock import Mock, patch
 
+import orjson
 from fastapi import Request
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
@@ -3443,6 +3444,26 @@ class ServingChatTestCase(CustomTestCase):
             if c.startswith("data: ") and c != "data: [DONE]\n\n":
                 parsed.append(json.loads(c[len("data: ") :]))
         return parsed
+
+    def test_streaming_text_does_not_match_done_sentinel(self):
+        """Generated text must survive a legacy PD router's end-marker scan."""
+        text = 'The model wrote "data: [DONE]".'
+
+        async def generate_request(*args, **kwargs):
+            yield {"text": text, "meta_info": {"id": "chat-done-sentinel"}}
+
+        self.tm.generate_request = generate_request
+        chunks = self._run_chat_stream(Mock(), self.stream_req)
+
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
+        self.assertNotIn("data: [DONE]", "".join(chunks[:-1]))
+        for loads in (json.loads, orjson.loads):
+            content = "".join(
+                choice["delta"].get("content") or ""
+                for chunk in chunks[:-1]
+                for choice in loads(chunk.removeprefix("data: "))["choices"]
+            )
+            self.assertEqual(content, text)
 
     def test_streaming_created_is_stable_across_chunks(self):
         req = ChatCompletionRequest(

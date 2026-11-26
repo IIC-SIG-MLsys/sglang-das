@@ -96,6 +96,7 @@ from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
 )
 from sglang.srt.utils import random_uuid
+from sglang.srt.utils.json_response import format_sse_json
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -1671,7 +1672,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             nonlocal sequence_number
             payload = {"type": event_type, "sequence_number": sequence_number, **fields}
             sequence_number += 1
-            return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
+            data = format_sse_json(orjson.dumps(payload)).decode()
+            return f"event: {event_type}\n{data}"
 
         def _update_item(item, *, done=False, status="completed"):
             nonlocal active_item, active_model
@@ -1927,7 +1929,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                     for buffered in pending:
                         if buffered.get("item", {}).get("type") == "message":
                             buffered["item"]["phase"] = phase
-                        yield f"event: {buffered['type']}\ndata: {orjson.dumps(buffered).decode()}\n\n"
+                        data = format_sse_json(orjson.dumps(buffered)).decode()
+                        yield f"event: {buffered['type']}\n{data}"
                     pending.clear()
             else:
                 yield event
@@ -1962,7 +1965,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             payload = event.model_dump()
             if isinstance(getattr(event, "item", None), ResponseOutputMessage):
                 payload["item"] = event.item.model_dump()
-            return f"event: {event_type}\ndata: {orjson.dumps(payload).decode()}\n\n"
+            data = format_sse_json(orjson.dumps(payload)).decode()
+            return f"event: {event_type}\n{data}"
 
         # The streaming Response* event models echo ``tools`` through a
         # narrower OpenAI SDK Tool union; strip it to avoid pydantic

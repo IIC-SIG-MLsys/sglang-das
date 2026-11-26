@@ -77,6 +77,7 @@ from sglang.srt.layers.aux_hidden_states import (
     pack_aux_hidden_states,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
@@ -2520,25 +2521,39 @@ class MQALayer(MqaAttentionBase):
                     forward_batch=forward_batch,
                 )
             elif use_cp:
-                # every rank writes the whole chunk's window KV with the fused fp32 store
+                # The fused fp32 store writes the whole chunk on the layer owner.
                 if qkv_a is not None:
                     kv = qkv_a[..., self.q_lora_rank :]
                 else:
                     kv, _ = self.wkv(x_linear)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                tail = attn_backend.forward_metadata.late_layer_tail
-                global_positions = (
-                    tail.pos_global
-                    if tail is not None
-                    else forward_batch.positions[: kv.shape[0]]
-                )
+                rank_major_store = None
+                if (
+                    _is_hcu
+                    and layer_split_cp
+                    and envs.SGLANG_OPT_DSV41_CP_SWA_RANK_MAJOR_STORE.get()
+                ):
+                    rank_major_store = attn_backend.get_cp_rank_major_swa_store(
+                        forward_batch, kv.shape[0]
+                    )
+                if rank_major_store is not None:
+                    swa_loc, global_positions = rank_major_store
+                    kv = attn_cp_interleave_gather(kv)
+                else:
+                    kv = cp_materialize_global_token_order(
+                        kv.contiguous(),
+                        forward_batch,
+                        torch.cuda.current_stream(),
+                    )
+                    tail = attn_backend.forward_metadata.late_layer_tail
+                    global_positions = (
+                        tail.pos_global
+                        if tail is not None
+                        else forward_batch.positions[: kv.shape[0]]
+                    )
+                    swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
                 get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
                     layer_id=self.layer_id,
-                    swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+                    swa_loc=swa_loc,
                     kv=kv,
                     kv_weight=self.kv_norm.weight.data,
                     eps=self.eps,

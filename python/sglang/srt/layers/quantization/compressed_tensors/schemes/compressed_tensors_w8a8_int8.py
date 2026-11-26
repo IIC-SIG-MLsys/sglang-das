@@ -327,6 +327,24 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
         else:
             x_q, x_scale = per_token_quant_int8(x)
 
+        if (
+            _is_hcu
+            and bias is None
+            and self.prequantized_input_eligible
+            and self.strategy == QuantizationStrategy.CHANNEL
+            and self.w8a8_strategy in (1, 3)
+        ):
+            tuned = ops.try_configured_w8a8_scaled_mm(
+                x_q,
+                layer.weight,
+                x_scale,
+                layer.weight_scale,
+                x.dtype,
+                self.w8a8_strategy,
+            )
+            if tuned is not None:
+                return tuned
+
         # return quant_ops.custom_scaled_mm(x_q, layer.weight, x_scale, layer.weight_scale, out_dtype=x.dtype, bias=bias)
 
         if self.w8a8_strategy == 1:
@@ -334,37 +352,9 @@ class CompressedTensorsW8A8Int8(CompressedTensorsLinearScheme):
             k = x_q.shape[1]
             n = layer.weight.shape[1]
 
-            if len(W8A8_TRITONJSON.triton_json_dict) == 0:
-                best_config = None
-
-            elif f"1_{n}_{k}" in W8A8_TRITONJSON.triton_json_dict:
-                if m <= 16:
-                    m_ = m
-                elif m <= 64:
-                    m_ = (m + 3) & -4  # 取值到最近的4的倍数
-                elif m <= 160:
-                    m_ = (m + 7) & -8
-
-                elif m < 200:  # 256
-                    m_ = 160
-                elif m < 480:  # 512
-                    m_ = 256
-                elif m < 960:  # 1024
-                    m_ = 512
-                elif m < 2048:
-                    m_ = 1024
-                elif m < 4096:
-                    m_ = 2048
-                elif m < 6000:
-                    m_ = 4096
-                else:
-                    m_ = 8192
-
-                best_config = W8A8_TRITONJSON.triton_json_dict[f"{m_}_{n}_{k}"]
-
-            else:
-                best_config = None
-
+            best_config = ops.w8a8_triton_config(
+                W8A8_TRITONJSON.triton_json_dict, m, n, k
+            )
             return ops.triton_scaled_mm(
                 x_q,
                 layer.weight,

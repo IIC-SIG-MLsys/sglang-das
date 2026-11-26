@@ -282,11 +282,18 @@ def _select_candidate_blocks_lightop(
     topk_blocks: int,
     *,
     return_block_ids: bool = False,
+    return_mask: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Select blocks and expand the mask in one LightOp kernel, without fallback."""
+    """Get logical IDs with the block table op, or use the fused mask ABI."""
+    if not return_mask and lightop_indexer.lightop_candidate_table_available():
+        return lightop_indexer.logical_candidate_block_ids(
+            logits, compress_lens, topk_blocks
+        )
     mask, block_ids = lightop_indexer.candidate_block_mask(
         logits, compress_lens, topk_blocks
     )
+    if not return_mask:
+        return block_ids
     return (mask, block_ids) if return_block_ids else mask
 
 
@@ -296,6 +303,7 @@ def _select_candidate_blocks_fused(
     topk_blocks: int,
     *,
     return_block_ids: bool = False,
+    return_mask: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Fast path for block_size==8: replaces the block-level ``torch.topk`` (which
     lowers to the multi-kernel mbtopk radix reduction) with a fused top-k, then
@@ -322,6 +330,8 @@ def _select_candidate_blocks_fused(
     keys.scatter_(1, last_block.unsqueeze(1), torch.inf)
 
     block_ids = _topk_block_ids(keys, nblocks, topk_blocks)  # [bs, K] int32
+    if not return_mask:
+        return block_ids
 
     # Expand block ids back to a position-level bool mask [bs, width].
     k = block_ids.shape[1]
@@ -375,11 +385,13 @@ def select_candidate_blocks(
     block_size: int,
     *,
     return_block_ids: bool = False,
+    return_mask: bool = True,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Level one of the two-level top-k: a bool mask over positions keeping the
     topk_blocks best-scoring blocks per query. Unreachable positions are already -inf
     in logits, so an all -inf block means not reachable yet; the block holding the
-    query's newest position is always kept."""
+    query's newest position is always kept. Pass ``return_mask=False`` for
+    IDs alone, or ``return_block_ids=True`` for both the mask and IDs."""
     # Fast path: block_size==8 replaces the block-level torch.topk (mbtopk) with
     # a fused top-k -- lightop's prebuilt Top2048 on HIP/DCU, the JIT v2 kernel
     # on NVIDIA -- to avoid the multi-kernel reduction over the position dim.
@@ -391,10 +403,18 @@ def select_candidate_blocks(
     ):
         if _IS_HCU and envs.SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS.get():
             return _select_candidate_blocks_lightop(
-                logits, compress_lens, topk_blocks, return_block_ids=return_block_ids
+                logits,
+                compress_lens,
+                topk_blocks,
+                return_block_ids=return_block_ids,
+                return_mask=return_mask,
             )
         return _select_candidate_blocks_fused(
-            logits, compress_lens, topk_blocks, return_block_ids=return_block_ids
+            logits,
+            compress_lens,
+            topk_blocks,
+            return_block_ids=return_block_ids,
+            return_mask=return_mask,
         )
 
     width = logits.size(-1)
@@ -408,11 +428,12 @@ def select_candidate_blocks(
     )
 
     top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
+    if return_block_ids or not return_mask:
+        block_ids = top.indices.masked_fill(top.values <= -torch.inf, -1).to(torch.int32)
+    if not return_mask:
+        return block_ids
     keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
         -1, top.indices, top.values > -torch.inf
     )
     mask = keep.repeat_interleave(block_size, dim=-1)[..., :width]
-    if return_block_ids:
-        block_ids = top.indices.masked_fill(top.values <= -torch.inf, -1)
-        return mask, block_ids.to(torch.int32)
-    return mask
+    return (mask, block_ids) if return_block_ids else mask

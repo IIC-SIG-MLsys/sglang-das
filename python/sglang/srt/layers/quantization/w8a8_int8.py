@@ -306,6 +306,18 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x_q_2d = x_q.view(-1, x_q.shape[-1])
         x_scale_2d = x_scale.view(-1, x_scale.shape[-1])
 
+        if _is_hcu and bias is None:
+            tuned = compressed_quant_ops.try_configured_w8a8_scaled_mm(
+                x_q_2d,
+                layer.weight,
+                x_scale_2d,
+                layer.weight_scale,
+                x.dtype,
+                self.w8a8_strategy,
+            )
+            if tuned is not None:
+                return tuned.view(*x_q.shape[:-1], tuned.shape[-1])
+
         if _is_hcu and self.w8a8_strategy == 3:
             output_shape = [*x_q.shape[:-1], layer.weight.shape[0]]
             output = compressed_quant_ops.blaslt_scaled_mm(
@@ -602,7 +614,13 @@ def _grouped(x, w, s, groups, rank, *, output_dtype=None):
             (x.shape[0], groups, rank), device=x.device, dtype=output_dtype or x.dtype
         )
     from sglang.kernels.ops.gemm import dsv41_int8 as dsv41_int8_blaslt
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 
+    if is_batch_invariant_mode_enabled():
+        # Keep batch-invariant mode on the fixed-rank, INT32 accumulation path.
+        return dsv41_int8_blaslt.project(
+            x, w, s, groups, rank, output_dtype=output_dtype, algo_rank=0
+        )
     return dsv41_int8_blaslt.project(
         x, w, s, groups, rank, output_dtype=output_dtype
     )

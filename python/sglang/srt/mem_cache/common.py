@@ -120,8 +120,7 @@ def free_swa_out_of_window_slots(
     req.kv.set_evicted_seqlen(component_type, evicted_seqlen)
 
     if not supports_prefix_sharing:
-        # Nothing is inserted into a tree, so no tombstone-leaf concern; evict
-        # up to the window boundary (the trailing floor keeps it page-aligned).
+        # With no leaf being published here, start at the active-window boundary.
         evict_threshold = pre_len - sliding_window_size
     else:
         # Prefix-sharing cache: keep max(window, page) rounded up to whole pages, so
@@ -130,10 +129,8 @@ def free_swa_out_of_window_slots(
         evict_threshold = pre_len - ceil_align(
             max(sliding_window_size, page_size), page_size
         )
-    if retain_floor is not None and supports_prefix_sharing:
-        # The caller owns where the floor is (see BasePrefixCache.swa_retain_floor);
-        # this only promises not to free past it. Without prefix sharing a retained
-        # checkpoint could never be matched, so holding it is pure cost.
+    if retain_floor is not None:
+        # A caller may retain a future checkpoint even when it defers publication.
         evict_threshold = min(evict_threshold, retain_floor)
 
     new_evicted_seqlen = max(evicted_seqlen, evict_threshold)
