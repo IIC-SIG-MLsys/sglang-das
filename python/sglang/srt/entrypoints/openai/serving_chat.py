@@ -91,7 +91,6 @@ from sglang.srt.entrypoints.openai.utils import (
     process_spec_tokens_details_from_ret,
     should_include_usage,
     spec_tokens_details_from_meta_info,
-    to_openai_style_logprobs,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
@@ -427,6 +426,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 envs.SGLANG_DSV41_REASONING_EFFORT.get()
             )
             if self.chat_encoding_spec == "dsv41"
+            else None
+        )
+        self._dsv41_segmented_tokenizer = (
+            encoding_dsv41.load_segmented_tokenizer(self.tokenizer_manager.tokenizer)
+            if self.chat_encoding_spec == "dsv41"
+            and get_serving().tokenizer_backend == "fastokens"
             else None
         )
 
@@ -1929,28 +1934,34 @@ class OpenAIServingChat(OpenAIServingBase):
                     encoding_dsv41.attach_task_to_last_user_message(
                         messages, request.task
                     )
-                real_input, media = encoding_dsv41.encode_messages(
+                parts, media = encoding_dsv41.encode_messages(
                     messages,
                     thinking_mode=thinking_mode,
                     reasoning_effort=self._resolve_dsv41_reasoning_effort(
                         request.reasoning_effort
                     ),
                     return_multi_modal_data=True,
+                    return_prompt_parts=True,
                 )
+                tokenizer = self.tokenizer_manager.tokenizer
+                image_token = None
                 if media["images"]:
                     if not is_multimodal:
                         raise ValueError("image input is not supported for this model")
                     image_data.extend(
                         ImageData(url=image["url"]) for image in media["images"]
                     )
-                    tokenizer = self.tokenizer_manager.tokenizer
-                    real_input = real_input.replace(
-                        encoding_dsv41.IMAGE_PLACEHOLDER,
-                        tokenizer.convert_ids_to_tokens(
-                            self.tokenizer_manager.image_token_id
-                        ),
+                    image_token = tokenizer.convert_ids_to_tokens(
+                        self.tokenizer_manager.image_token_id
                     )
-                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+                    if image_token is None:
+                        raise ValueError("DeepSeek-V4.1 tokenizer has no image token")
+                prompt_ids = encoding_dsv41.tokenize_prompt_parts(
+                    parts,
+                    tokenizer,
+                    self._dsv41_segmented_tokenizer,
+                    image_token=image_token,
+                )
             else:
                 real_input = encoding_dsv32.encode_messages(
                     messages, thinking_mode=thinking_mode

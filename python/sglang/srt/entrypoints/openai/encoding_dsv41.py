@@ -6,7 +6,11 @@ Mid-conversation system messages trigger the assistant generation header.
 
 import copy
 import json
+import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # Special Tokens
@@ -24,6 +28,11 @@ SYSTEM_SP_TOKEN = "<｜System｜>"
 LATEST_REMINDER_SP_TOKEN = "<｜latest_reminder｜>"
 
 IMAGE_PLACEHOLDER = "<｜deepseek_image｜>"
+
+_TURN_STARTS = (USER_SP_TOKEN, SYSTEM_SP_TOKEN, LATEST_REMINDER_SP_TOKEN)
+# The Flash tokenizer uses angle-bracket delimited added tokens, plus DSML
+# prefixes and the standalone DSML marker. None can straddle a turn start.
+_ADDED_TOKEN_PATTERN = re.compile(r"<[^<>]+>|</?dsml:|｜DSML｜")
 
 # Task special tokens for internal classification tasks
 DS_TASK_SP_TOKENS = {
@@ -643,19 +652,19 @@ def _drop_thinking_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, An
     return result
 
 
-def _encode_messages_text(
+def _render_message_parts(
     messages: List[Dict[str, Any]],
     thinking_mode: str,
     context: Optional[List[Dict[str, Any]]] = None,
     drop_thinking: bool = True,
     add_default_bos_token: bool = True,
     reasoning_effort: Union[str, int, None] = None,
-) -> str:
-    """Encode preprocessed (text-only) messages into the V4.1 prompt format."""
+) -> List[str]:
+    """Render preprocessed messages in prompt order."""
     context = context if context else []
     full_messages = context + messages
 
-    prompt = bos_token if add_default_bos_token and len(context) == 0 else ""
+    parts = [bos_token] if add_default_bos_token and not context else []
 
     # Resolve drop_thinking: if any message has tools defined, don't drop thinking
     effective_drop_thinking = drop_thinking
@@ -671,15 +680,17 @@ def _encode_messages_text(
         context_len = len(context)
 
     for idx in range(num_to_render):
-        prompt += render_message(
-            idx + context_len,
-            full_messages,
-            thinking_mode=thinking_mode,
-            drop_thinking=effective_drop_thinking,
-            reasoning_effort=reasoning_effort,
+        parts.append(
+            render_message(
+                idx + context_len,
+                full_messages,
+                thinking_mode=thinking_mode,
+                drop_thinking=effective_drop_thinking,
+                reasoning_effort=reasoning_effort,
+            )
         )
 
-    return prompt
+    return parts
 
 
 def encode_messages(
@@ -690,10 +701,13 @@ def encode_messages(
     add_default_bos_token: bool = True,
     reasoning_effort: Union[str, int, None] = None,
     return_multi_modal_data: bool = False,
+    *,
+    return_prompt_parts: bool = False,
 ) -> Any:
     """Encode a list of messages into the DeepSeek-V4.1 prompt format.
 
-    Returns the prompt string, or ``(prompt, {"images": [...]})`` when
+    Returns the prompt string (or its rendered parts with ``return_prompt_parts``),
+    wrapped as ``(prompt, {"images": [...]})`` when
     ``return_multi_modal_data`` is set; the image records are in prompt order.
     """
     # Validate before merging can discard message-level textual fields.
@@ -706,7 +720,7 @@ def encode_messages(
     messages = sort_tool_results_by_call_order(context + messages)[len(context) :]
     processed_context, _ = process_image_messages(context) if context else ([], [])
     processed_messages, images = process_image_messages(messages)
-    prompt = _encode_messages_text(
+    parts = _render_message_parts(
         processed_messages,
         thinking_mode=thinking_mode,
         context=processed_context if processed_context else None,
@@ -714,6 +728,77 @@ def encode_messages(
         add_default_bos_token=add_default_bos_token,
         reasoning_effort=reasoning_effort,
     )
+    prompt = parts if return_prompt_parts else "".join(parts)
     if return_multi_modal_data:
         return prompt, {"images": images}
     return prompt
+
+
+def load_segmented_tokenizer(tokenizer: Any) -> Any:
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if type(backend).__module__.partition(".")[0] != "fastokens":
+        return None
+
+    from fastokens import Tokenizer
+
+    if not hasattr(Tokenizer, "encode_segments"):
+        logger.warning("DeepSeek-V4.1 segmented encoding requires fastokens>=0.3.2")
+        return None
+
+    tokenizer_json = backend.to_str()
+    config = json.loads(tokenizer_json)
+    added_tokens = config["added_tokens"]
+    if (
+        tokenizer.split_special_tokens
+        or config["normalizer"] not in (None, {"type": "Sequence", "normalizers": []})
+        or not set(_TURN_STARTS).issubset(token["content"] for token in added_tokens)
+        or any(
+            token["single_word"]
+            or token["lstrip"]
+            or token["rstrip"]
+            or not _ADDED_TOKEN_PATTERN.fullmatch(token["content"])
+            for token in added_tokens
+        )
+    ):
+        return None
+
+    # Own the tokenizer settings so padding/truncation in other HF calls cannot
+    # affect this path. HF encode() issues an unpadded, untruncated request.
+    segmented_tokenizer = Tokenizer.from_json_str(tokenizer_json)
+    if segmented_tokenizer.num_special_tokens_to_add(False):
+        return None
+    segmented_tokenizer.no_padding()
+    segmented_tokenizer.no_truncation()
+    logger.info("DeepSeek-V4.1 prompt encoder: fastokens segmented")
+    return segmented_tokenizer
+
+
+def tokenize_prompt_parts(
+    parts: List[str],
+    tokenizer: Any,
+    segmented_tokenizer: Any,
+    *,
+    image_token: Optional[str] = None,
+) -> List[int]:
+    if segmented_tokenizer is None:
+        prompt = "".join(parts)
+        if image_token is not None:
+            prompt = prompt.replace(IMAGE_PLACEHOLDER, image_token)
+        return tokenizer.encode(prompt)
+
+    # Only split before an added role token. Otherwise adjacent rendered text
+    # may tokenize jointly (e.g. an assistant continuation without a marker).
+    segments = []
+    current = []
+    for part in parts:
+        if current and part.startswith(_TURN_STARTS):
+            segments.append("".join(current))
+            current = []
+        current.append(part)
+    if current:
+        segments.append("".join(current))
+    if image_token is not None:
+        segments = [text.replace(IMAGE_PLACEHOLDER, image_token) for text in segments]
+    # The native V4.1 renderer historically recognizes added tokens anywhere
+    # in the prompt, including matching spellings in message text.
+    return segmented_tokenizer.encode_segments([(text, True) for text in segments]).ids
