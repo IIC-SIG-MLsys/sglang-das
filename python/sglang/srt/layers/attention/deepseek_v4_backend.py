@@ -150,6 +150,7 @@ from sglang.srt.layers.attention.verify_mask import (
 )
 from sglang.srt.layers.cp.interleave import (
     InterleaveContextParallelMetadata,
+    attn_cp_interleave_gather,
     interleave_rows_per_request,
 )
 from sglang.srt.layers.cp.utils import (
@@ -161,6 +162,7 @@ from sglang.srt.layers.dp_attention import (
     set_local_dp_buffer_len,
 )
 from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    can_optimize_hcu_cp_gather,
     is_cp_cache_layer_split_deepseek_v4_pool,
     maybe_prepare_cp_cache_layer_split_forward,
 )
@@ -387,6 +389,24 @@ def _request_window_allows_sparse_prefill(pool, forward_batch, core_metadata) ->
         and dsa_use_prefill_cp(forward_batch)
         and core_metadata.request_window_layout is not None
     )
+
+
+def _gather_cp_compressor_projection(compressor, x):
+    if compressor.compress_ratio == 1:
+        projected, _ = compressor.project(x)
+    else:
+        # The fused C2 GEMM already emits [KV | score] in one tensor.
+        projected = compressor.project_fused(x)
+
+    gathered = attn_cp_interleave_gather(projected)
+    ordered = (
+        gathered.view(-1, x.shape[0], gathered.shape[-1])
+        .transpose(0, 1)
+        .reshape(gathered.shape)
+    )
+    if compressor.compress_ratio == 1:
+        return ordered, None
+    return ordered.chunk(2, dim=-1)
 
 
 def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
@@ -1415,6 +1435,8 @@ class DSV4Metadata:
     low_ratio_dense_metadata: Dict[int, _LowRatioDenseMetadata] = field(
         default_factory=dict
     )
+    # Global SWA slots and positions in the receive order of the CP all-gather.
+    cp_rank_major_swa_store: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1452,6 +1474,7 @@ class DSV4Metadata:
         self.prefill_shared_reads_snapshotted = False
         self.low_ratio_query_lens = None
         self.low_ratio_dense_metadata.clear()
+        self.cp_rank_major_swa_store = None
 
     def refresh_for_breakable_cuda_graph_replay_(
         self,
@@ -1499,6 +1522,7 @@ class DSV4Metadata:
         self.prefill_shared_reads_snapshotted = False
         self.low_ratio_query_lens = None
         self.low_ratio_dense_metadata.clear()
+        self.cp_rank_major_swa_store = None
 
 
 @dataclass
@@ -4053,10 +4077,27 @@ class DeepseekV4AttnBackend(
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
-            x_global = cp_materialize_global_token_order(
-                x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )[:total]
             keep = getattr(forward_batch, "encoder_swa_compress_rows", None)
+            compressor = layer.compressor
+            projected = None
+            if (
+                _is_hcu
+                and envs.SGLANG_OPT_DSV41_CP_LOCAL_COMPRESSOR_PROJECTION.get()
+                and tail is None
+                and keep is None
+                and (layer.compress_ratio == 1 or compressor.use_fused_gate)
+                and can_optimize_hcu_cp_gather(
+                    self.token_to_kv_pool, forward_batch, x.shape[0]
+                )
+            ):
+                # The projection is row-local. Pairing, request-ring updates,
+                # and the compressed/index-K writes still see global order.
+                projected = _gather_cp_compressor_projection(compressor, x)
+                x_global = None
+            else:
+                x_global = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, torch.cuda.current_stream()
+                )[:total]
             out_loc_rows = None
             if _is_hcu and keep is not None:
                 if tail is None:
@@ -4073,8 +4114,9 @@ class DeepseekV4AttnBackend(
                 x_global,
                 req_global,
                 pos_global,
+                projected=projected,
                 out_loc_rows=out_loc_rows,
-                fuse_index_store=(x_global.is_cuda and _supports_index_k_rope_pack()),
+                fuse_index_store=(x.is_cuda and _supports_index_k_rope_pack()),
                 fuse_rope_fq_store=True,
             )
         if run_indexer and layer.indexer is not None:
@@ -5934,6 +5976,29 @@ class DeepseekV4AttnBackend(
         return self.token_to_kv_pool.translate_loc_from_full_to_swa(out_cache_loc).to(
             torch.int32
         )
+
+    def get_cp_rank_major_swa_store(
+        self, forward_batch: ForwardBatch, local_rows: int
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        metadata = self.forward_metadata
+        if metadata.late_layer_tail is not None or not can_optimize_hcu_cp_gather(
+            self.token_to_kv_pool, forward_batch, local_rows
+        ):
+            return None
+        if metadata.cp_rank_major_swa_store is None:
+            cp_size = self.token_to_kv_pool.cp_size
+            num_rows = local_rows * cp_size
+            swa_loc = self.get_swa_out_cache_loc(forward_batch)
+            positions = forward_batch.positions
+            if swa_loc.shape != (num_rows,) or positions.shape != (num_rows,):
+                return None
+            # The store is independent per slot. Move the two small metadata
+            # vectors once per chunk instead of moving KV rows in each layer.
+            metadata.cp_rank_major_swa_store = (
+                swa_loc.reshape(-1, cp_size).T.flatten(),
+                positions.reshape(-1, cp_size).T.flatten(),
+            )
+        return metadata.cp_rank_major_swa_store
 
     def store_cache(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch

@@ -1877,6 +1877,10 @@ class Envs:
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
     SGLANG_DSV4_FUSE_MHC_REPEAT_CP_SPLIT = EnvBool(True)
     SGLANG_DSV4_CP_OUTPUT_INPLACE = EnvBool(True)
+    # HCU V4.1 LayerSplit prefill experiments for equal, unpadded CP shards.
+    SGLANG_OPT_DSV41_CP_SWA_RANK_MAJOR_STORE = EnvBool(False)
+    # A smaller compressor GEMM can select a different accumulation schedule.
+    SGLANG_OPT_DSV41_CP_LOCAL_COMPRESSOR_PROJECTION = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     # Store the DSV4 C4 indexer K cache as signed INT8 plus one FP32 scale
     # per token on HCU gfx936. The packed page ABI remains 132 bytes/token.
