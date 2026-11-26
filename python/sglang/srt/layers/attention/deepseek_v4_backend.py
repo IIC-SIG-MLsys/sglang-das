@@ -5129,6 +5129,25 @@ class DeepseekV4AttnBackend(
             weights = indexer.head_weights(x).float().contiguous()
             if not use_hcu_prep:
                 ke = ks + compress_lens
+            if (
+                envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA.get()
+                and forward_batch.forward_mode == ForwardMode.EXTEND
+                and not indexer.uses_candidates
+                and self._try_low_ratio_index_topk_fused(
+                    indexer,
+                    q,
+                    (k_fp4, k_sf),
+                    weights,
+                    ks,
+                    compress_lens,
+                    k_slots,
+                    lc_per_req,
+                    q_lens_cpu,
+                    page_indices,
+                    raw_indices,
+                )
+            ):
+                return
             candidate_blocks = self._hcu_prefill_candidate_blocks(
                 indexer, lc_per_req, q_lens_cpu
             )
@@ -5230,6 +5249,132 @@ class DeepseekV4AttnBackend(
             raw_indices[:num_tokens, :topk] = torch.where(
                 chosen, selected - ks[:, None], -1
             )
+
+    def _try_low_ratio_index_topk_fused(
+        self,
+        indexer,
+        q,
+        kv,
+        weights,
+        ks,
+        compress_lens,
+        k_slots,
+        lc_per_req,
+        q_lens_cpu,
+        page_indices,
+        raw_indices,
+    ) -> bool:
+        source = indexer.is_candidate_source
+        min_keys = (
+            envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_SOURCE_MIN_K
+            if source
+            else envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_MIN_K
+        ).get()
+        # Keep batches with a short live request on the shared LightOp path.
+        live_lengths = (
+            length for length, count in zip(lc_per_req, q_lens_cpu) if length and count
+        )
+        shortest = min(live_lengths, default=0)
+        if not shortest or shortest < min_keys:
+            return False
+
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+            finish_flat_indexer_topk,
+        )
+        from sglang.kernels.ops.attention.dsv4.fused_fp4_mqa import (
+            BLOCK_SIZE,
+            MAX_QUERY_ROWS,
+            SOURCE_TOPK,
+            TOKEN_TOPK,
+            fused_fp4_mqa_available,
+            fused_fp4_mqa_topk,
+        )
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+        from sglang.srt.layers.attention.mqa_logits_utils import (
+            dsv41_mqa_logits_rows_per_chunk,
+        )
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            get_is_capture_mode,
+        )
+
+        if (
+            indexer.index_topk != TOKEN_TOPK
+            or q.shape[1:] != (32, 128)
+            or get_disagg().disaggregation_mode == "decode"
+            or get_exec().deterministic.enable_deterministic_inference
+            or is_batch_invariant_mode_enabled()
+            or get_is_capture_mode()
+            or (
+                source
+                and (
+                    indexer.candidate_topk_blocks != SOURCE_TOPK
+                    or indexer.candidate_block_size != BLOCK_SIZE
+                    or not envs.SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS.get()
+                )
+            )
+            or not fused_fp4_mqa_available(q.device)
+        ):
+            return False
+
+        published = []
+        row_start = key_start = 0
+        for length, count in zip(lc_per_req, q_lens_cpu):
+            row_end, key_end = row_start + count, key_start + length
+            if length and count:
+                # The flattened gather is request-major. Keep block zero at
+                # each request's logical start, even at an unaligned KV offset.
+                request_kv = tuple(t[key_start:key_end].contiguous() for t in kv)
+                num_blocks = (length + BLOCK_SIZE - 1) // BLOCK_SIZE
+                scratch_cols = max(
+                    num_blocks + (SOURCE_TOPK if source else 0),
+                    min(num_blocks, TOKEN_TOPK) * BLOCK_SIZE,
+                )
+                budget_rows = dsv41_mqa_logits_rows_per_chunk(
+                    num_rows=count, num_cols=scratch_cols, device_index=q.device.index
+                )
+                step = min(budget_rows or count, MAX_QUERY_ROWS)
+                block_ids = (
+                    torch.empty(
+                        (count, SOURCE_TOPK), dtype=torch.int32, device=q.device
+                    )
+                    if source and step < count
+                    else None
+                )
+                for start in range(row_start, row_end, step):
+                    end = min(start + step, row_end)
+                    rows = slice(start, end)
+                    offsets = ks[rows].contiguous()
+                    selected, blocks = fused_fp4_mqa_topk(
+                        q[rows].contiguous(),
+                        request_kv,
+                        weights[rows],
+                        compress_lens[rows].contiguous(),
+                        offsets=offsets,
+                        publish_blocks=source,
+                    )
+                    finish_flat_indexer_topk(
+                        selected,
+                        k_slots,
+                        offsets,
+                        page_indices[rows, :TOKEN_TOPK],
+                        raw_indices[rows, :TOKEN_TOPK]
+                        if raw_indices is not None
+                        else None,
+                    )
+                    if block_ids is not None:
+                        block_ids[start - row_start : end - row_start].copy_(blocks)
+                if source:
+                    published.append(blocks if block_ids is None else block_ids)
+            elif source:
+                published.append(
+                    torch.empty((count, 0), dtype=torch.int32, device=q.device)
+                )
+            row_start, key_start = row_end, key_end
+        if source:
+            self.forward_metadata.candidate_metadata = CandidateMasks(
+                request_block_ids=published
+            )
+        return True
 
     def _low_ratio_index_topk_chunked(
         self,

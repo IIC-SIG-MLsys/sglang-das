@@ -401,6 +401,15 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.fused_fp4_mqa_topk",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsv4.fused_fp4_mqa:fused_fp4_mqa_topk",
+        # gfx936 is checked by the entry point.
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 
 for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
     register_kernel(

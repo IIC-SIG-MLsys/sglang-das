@@ -1185,6 +1185,11 @@ class Envs:
     SGLANG_USE_LIGHTOP_DSV41_PAGED_INDEXER = EnvBool(True)
     # HCU block selection on dense logits; 0 keeps the block-amax + top-k path.
     SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS = EnvBool(True)
+    # Opt-in gfx936 eager dense prefill. Select tokens using block maxima and a rescore.
+    SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA = EnvBool(False)
+    # Minimum compressed key lengths for live requests in the fused prefill batch.
+    SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_MIN_K = EnvInt(131072)
+    SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_SOURCE_MIN_K = EnvInt(81920)
     # Consume Prefill candidates directly from the paged index-K cache on HCU.
     SGLANG_HCU_PREFILL_PAGED_SPARSE = EnvBool(True)
     # Eager HCU C1/C2 keeps a compact layout; opt in to TopK-union dequantization.
