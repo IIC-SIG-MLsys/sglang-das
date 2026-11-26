@@ -175,4 +175,3 @@ zero-workspace static ranks baked into `_DEFAULT_GFX936_UNPACKED_ALGO_RANKS`:
 | Full `lm_head` (decode) | `(1, 129280, 5120)` | `33–63` (uncovered) | rank `0` (`3.2–4.0 ms`) | rank `3–5` (`~0.85 ms`) | `~4.0×` |
 | Draft `wo_a` | `(8, 512, 4096)` | `1–320` | rank `0/6/15/23` | exact ranks (`29–84 µs`) | up to `4.4×` |
 | `markov_w2` | `(1, 129280/16160, 256)` | `1–64` | rank `0` on uncovered `M` | exact ranks (`11–110 µs`) | up to `2.9×` |
-
