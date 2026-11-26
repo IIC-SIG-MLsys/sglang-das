@@ -3,10 +3,14 @@
 import threading
 import time
 import unittest
+from array import array
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
+
+import numpy as np
+import torch
 
 from sglang.srt.arg_groups.overrides import resolving_view
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
@@ -912,6 +916,68 @@ class TestAllocationIntegration(CustomTestCase):
                     self.assertEqual(queue._num_published_destinations, 1)
                 finally:
                     override.restore()
+
+    def test_inflight_coalescing_requires_an_aligned_additional_prefix(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.token_to_kv_pool = SimpleNamespace(compression_ratios=[0, 4, 128])
+        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=256)
+        # floor(common / 256) * 256 must reach 4096 + 129.
+        need = 4352
+        prompt = array("q", range(need + 1))
+        req = SimpleNamespace(origin_input_ids=prompt)
+        inflight_req = SimpleNamespace(origin_input_ids=prompt[:])
+        queue._dsv4_inflight_prompt_reqs = lambda _: [req, inflight_req]
+
+        def should_wait():
+            return queue._should_wait_for_dsv4_inflight_prompt(
+                req, prefix_len=129, preallocated_reqs=[]
+            )
+
+        inflight_req.origin_input_ids[need] = 255
+        self.assertTrue(should_wait())
+        inflight_req.origin_input_ids[need - 1] = 255
+        self.assertFalse(should_wait())
+        inflight_req.origin_input_ids = list(prompt[:need])
+        self.assertTrue(should_wait())
+        inflight_req.origin_input_ids.pop()
+        self.assertFalse(should_wait())
+
+    def test_decode_metadata_translates_only_suffix_page_representatives(self):
+        page_size = 256
+        logical_pages = torch.tensor([37, 11, 31], dtype=torch.int32)
+        suffix = (
+            logical_pages[:, None] * page_size
+            + torch.arange(page_size, dtype=torch.int32)
+        ).flatten()[: 2 * page_size + 19]
+        v2p = torch.zeros(38, dtype=torch.int64)
+        v2p[logical_pages] = torch.tensor([9, 22, 7])
+
+        def translate(tokens):
+            self.assertEqual(tokens.numel(), 3)
+            return v2p[tokens // page_size] * page_size + tokens % page_size
+
+        receiver = Mock()
+        entry = DecodeRequest(
+            req=SimpleNamespace(time_stats=Mock()), kv_receiver=receiver
+        )
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.req_to_metadata_buffer_idx_allocator = Mock()
+        queue.req_to_metadata_buffer_idx_allocator.alloc.return_value = 4
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            translate_kv_indices_for_transfer=translate
+        )
+        queue.transfer_queue = SimpleNamespace(enable_staging=False)
+        queue._num_published_destinations = 0
+        queue._send_kv_metadata(
+            entry, suffix, page_size, translate_for_transfer=True, decode_prefix_len=256
+        )
+        pages, aux_index, _ = receiver.send_metadata.call_args.args
+        np.testing.assert_array_equal(pages, np.array([9, 22, 7], dtype=np.int32))
+        self.assertEqual(pages.dtype, np.int32)
+        self.assertEqual(aux_index, 4)
+        self.assertEqual(
+            receiver.send_metadata.call_args.kwargs["decode_prefix_len"], 256
+        )
 
     def test_normal_bootstrap_keeps_room_without_dispatching_recompute(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)

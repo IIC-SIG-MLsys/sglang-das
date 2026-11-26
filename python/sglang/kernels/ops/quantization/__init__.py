@@ -19,6 +19,16 @@ if TYPE_CHECKING:
 
 register_kernel(
     KernelSpec(
+        op="quantization.quantize_wo_a_inverse_rope",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.dsv41_int8:quantize_wo_a_inverse_rope",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
         op="quantization.sgl_per_token_quant_fp8",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.quantization.per_token_quant_fp8:per_token_quant_fp8",

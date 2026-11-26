@@ -28,14 +28,27 @@ import hashlib
 import logging
 import math
 import time
+from array import array
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
+from itertools import islice
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import numpy as np
 import torch
+from torch.profiler import record_function
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
@@ -81,6 +94,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
     prepare_abort,
     setup_state_kv_args,
+    translate_transfer_pages,
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
@@ -620,26 +634,32 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not self._uses_dsv4_decode_radix_cache() or prefix_len <= 0:
             return prefix_len
 
-        compression_ratios = self.token_to_kv_pool.compression_ratios
-        max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
-        page_size = self.token_to_kv_pool_allocator.page_size
-        alignment = math.lcm(page_size, max_compression_ratio)
+        alignment = self._dsv4_prefix_alignment()
         return (prefix_len // alignment) * alignment
 
-    def _dsv4_singleflight_min_prefix_len(self) -> int:
+    def _dsv4_prefix_alignment(self) -> int:
         compression_ratios = self.token_to_kv_pool.compression_ratios
-        max_compression_ratio = max([r for r in compression_ratios if r > 0], default=1)
-        alignment = math.lcm(
+        max_compression_ratio = max((r for r in compression_ratios if r > 0), default=1)
+        return math.lcm(
             self.token_to_kv_pool_allocator.page_size, max_compression_ratio
         )
-        return max(4096, alignment)
 
     @staticmethod
-    def _common_prefix_len(lhs: List[int], rhs: List[int], limit: int) -> int:
-        for prefix_len in range(limit):
-            if lhs[prefix_len] != rhs[prefix_len]:
-                return prefix_len
-        return min(len(lhs), len(rhs), limit)
+    def _prompt_prefix_matches(
+        lhs: Sequence[int], rhs: Sequence[int], length: int
+    ) -> bool:
+        if min(len(lhs), len(rhs)) < length:
+            return False
+        if (
+            isinstance(lhs, array)
+            and isinstance(rhs, array)
+            and lhs.typecode == rhs.typecode == "q"
+        ):
+            return np.array_equal(
+                np.frombuffer(lhs, dtype="q", count=length),
+                np.frombuffer(rhs, dtype="q", count=length),
+            )
+        return all(a == b for a, b in zip(islice(lhs, length), islice(rhs, length)))
 
     def _dsv4_inflight_prompt_reqs(
         self, preallocated_reqs: List[DecodeRequest]
@@ -671,19 +691,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix_len: int,
         preallocated_reqs: List[DecodeRequest],
     ) -> bool:
-        min_prefix_len = self._dsv4_singleflight_min_prefix_len()
-        for inflight_req in self._dsv4_inflight_prompt_reqs(preallocated_reqs):
-            if inflight_req is req:
-                continue
-            common_len = self._common_prefix_len(
+        inflight_reqs = self._dsv4_inflight_prompt_reqs(preallocated_reqs)
+        if not inflight_reqs:
+            return False
+        alignment = self._dsv4_prefix_alignment()
+        # floor(common / alignment) * alignment >= prefix + min_gain
+        # iff the prompts match through the next aligned boundary.
+        required = ceil_align(prefix_len + max(4096, alignment), alignment)
+        return any(
+            inflight_req is not req
+            and self._prompt_prefix_matches(
                 req.origin_input_ids,
                 inflight_req.origin_input_ids,
-                min(len(req.origin_input_ids), len(inflight_req.origin_input_ids)),
+                required,
             )
-            safe_common_len = self._dsv4_safe_prefix_len(common_len)
-            if safe_common_len - prefix_len >= min_prefix_len:
-                return True
-        return False
+            for inflight_req in inflight_reqs
+        )
 
     def _release_decode_radix_match(self, req: Req) -> None:
         self._release_matched_prefix_lock(req)
@@ -2101,12 +2124,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if pp_size == 1:
                     pd_hidden_dst_indices = pd_hidden_dst_indices_by_pp.get(0)
 
-            dst_kv_indices = self._pre_alloc(
-                decode_req.req,
-                prefix_indices,
-                prefix_len,
-                total_prefix_len,
-            )
+            with record_function("pd.decode.pre_alloc"):
+                dst_kv_indices = self._pre_alloc(
+                    decode_req.req,
+                    prefix_indices,
+                    prefix_len,
+                    total_prefix_len,
+                )
             decode_req.pd_hidden_dst_indices = pd_hidden_dst_indices
             decode_req.pd_hidden_dst_indices_by_pp = pd_hidden_dst_indices_by_pp
             decode_req.pd_hidden_pp_slices = pd_hidden_pp_slices
@@ -2150,11 +2174,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_indices = dst_kv_indices[: origin_input_len - prefix_len]
             else:
                 # Only send delta indices (beyond prefix) to prefill.
-                kv_indices = (
-                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
-                        raw_kv_indices
-                    )
-                )
+                kv_indices = raw_kv_indices
 
             seq_len = origin_input_len
 
@@ -2185,12 +2205,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.kv.req_pool_idx, window_start:seq_len
                 ]
-                window_kv_indices_swa = (
-                    self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer(
-                        window_kv_indices_full
+                return (
+                    translate_transfer_pages(
+                        window_kv_indices_full,
+                        page_size,
+                        self.token_to_kv_pool_allocator.translate_swa_indices_for_transfer,
                     )
+                    .cpu()
+                    .numpy()
                 )
-                return kv_to_page_indices(window_kv_indices_swa, page_size)
 
             def _full_kv_pages_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
@@ -2304,9 +2327,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=total_prefix_len,
                     )
                 )
-            state_indices: Optional[List] = [
-                payloads[st]() if st in payloads else None for st in state_types
-            ]
+            with record_function("pd.decode.prepare_state_metadata"):
+                state_indices: Optional[List] = [
+                    payloads[st]() if st in payloads else None for st in state_types
+                ]
             if state_indices and not any(
                 idx is not None and len(idx) > 0 for idx in state_indices
             ):
@@ -2409,6 +2433,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 kv_indices,
                 kv_transfer_page_size,
                 state_indices,
+                translate_for_transfer=not self.scheduler.enable_hisparse,
                 **metadata_kwargs,
                 decode_prefix_len=total_prefix_len,
                 spec_metadata=spec_metadata,
@@ -2435,13 +2460,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return preallocated_reqs, failed_reqs
 
     def _send_kv_metadata(
-        self, decode_req, kv_indices, page_size, state_indices=None, **metadata_kwargs
+        self,
+        decode_req,
+        kv_indices,
+        page_size,
+        state_indices=None,
+        *,
+        translate_for_transfer=False,
+        **metadata_kwargs,
     ) -> None:
         decode_req.metadata_buffer_index = (
             self.req_to_metadata_buffer_idx_allocator.alloc()
         )
         assert decode_req.metadata_buffer_index is not None
-        page_indices = self._transfer_page_indices(decode_req, kv_indices, page_size)
+        with record_function("pd.decode.transfer_page_indices"):
+            page_indices = self._transfer_page_indices(
+                decode_req,
+                kv_indices,
+                page_size,
+                translate_for_transfer=translate_for_transfer,
+            )
         if (
             metadata_kwargs.get("destination") != KVTransferDestination.HOST
             and self.transfer_queue.enable_staging
@@ -2453,12 +2491,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.transfer_queue.staging_handler.register_decode_req(
                 decode_req.req.bootstrap_room, decode_req
             )
-        decode_req.kv_receiver.send_metadata(
-            page_indices,
-            decode_req.metadata_buffer_index,
-            state_indices,
-            **metadata_kwargs,
-        )
+        with record_function("pd.decode.send_kv_metadata"):
+            decode_req.kv_receiver.send_metadata(
+                page_indices,
+                decode_req.metadata_buffer_index,
+                state_indices,
+                **metadata_kwargs,
+            )
         if (
             decode_req.is_rebootstrap
             and get_disagg().disaggregation_decode_allocation_policy == "early"
@@ -2809,10 +2848,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return alloc_for_decode_prealloc(allocator, **kwargs)
 
     def _transfer_page_indices(
-        self, decode_req: DecodeRequest, kv_indices: torch.Tensor, page_size: int
+        self,
+        decode_req: DecodeRequest,
+        kv_indices: torch.Tensor,
+        page_size: int,
+        *,
+        translate_for_transfer: bool = False,
     ) -> np.ndarray:
+        if translate_for_transfer:
+            indices = (
+                translate_transfer_pages(
+                    kv_indices,
+                    page_size,
+                    self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer,
+                )
+                .cpu()
+                .numpy()
+            )
+        else:
+            indices = kv_to_page_indices(kv_indices, page_size)
         # int32 for ZMQ serialization -- from_zmq reads np.int32.
-        return kv_to_page_indices(kv_indices, page_size).astype(np.int32)
+        return indices.astype(np.int32, copy=False)
 
     def _pre_alloc(
         self,

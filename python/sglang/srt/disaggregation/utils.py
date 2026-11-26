@@ -9,6 +9,7 @@ from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Iterable,
     List,
@@ -58,6 +59,15 @@ if is_npu():
 # Constants & Enums
 #########################
 FAKE_BOOTSTRAP_HOST = "2.2.2.2"
+
+
+def translate_transfer_pages(
+    token_indices: torch.Tensor,
+    page_size: int,
+    translate_tokens: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Translate just the token representative of each page in a PD payload."""
+    return translate_tokens(token_indices[::page_size]) // page_size
 
 
 def pp_sync_polls(

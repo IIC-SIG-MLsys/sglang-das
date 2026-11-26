@@ -9,18 +9,78 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
 import torch
+
 from sglang.kernels.ops.gemm import dsv41_int8
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-class TestInt8KernelBridge(unittest.TestCase):
+
+class TestInt8KernelBridge(CustomTestCase):
     def tearDown(self):
         for function in [dsv41_int8.backend, dsv41_int8._service_config, dsv41_int8._algorithms, dsv41_int8._scale_schedules]:
             function.cache_clear()
         dsv41_int8._algo_rank_cache.clear()
         dsv41_int8._failed_static_algo_keys.clear()
         dsv41_int8._device_arch_cache.clear()
+
+    def test_unpacked_projection_consumes_rotated_quant_pair(self):
+        x = torch.zeros(2, 1, 2, dtype=torch.bfloat16)
+        q = torch.tensor([[[2, -3]], [[-4, 1]]], dtype=torch.int8)
+        xs = torch.tensor([[[0.25]], [[0.5]]])
+        weight = torch.tensor([[3, -2]], dtype=torch.int8)
+        ws = torch.tensor([[0.5]])
+
+        def gemm(operand, weights, result, *args):
+            result.copy_(operand.int() @ weights.int().T)
+
+        def scale(raw, input_scale, weight_scale, result, *args):
+            result.copy_(raw * input_scale * weight_scale.T)
+
+        ops = types.SimpleNamespace(gemm_out=gemm, scale_out=scale)
+        with patch.object(dsv41_int8, "load_native", return_value=ops):
+            actual = dsv41_int8._project_unpacked(
+                x, weight, ws, 1, 1, input_quant_args=(q, xs), algo_rank=0
+            )
+        expected = torch.tensor([[[1.5]], [[-3.5]]], dtype=x.dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_inverse_rope_projection_respects_fast_path_gates(self):
+        minimum = dsv41_int8._TRITON_QUANT_MIN_ELEMENTS
+        x = Mock(is_cuda=True, numel=Mock(return_value=minimum))
+        w, s, freqs, positions, pair, output = [object() for _ in range(6)]
+        with (
+            patch.object(dsv41_int8, "_supports_wo_a_inverse_rope", return_value=True),
+            patch.object(dsv41_int8, "_triton_quantize_enabled", return_value=True),
+            patch.object(dsv41_int8, "_is_gfx936_device", return_value=True),
+            patch.object(dsv41_int8, "_use_packed_service_projection") as packed,
+            patch.object(torch.cuda, "is_current_stream_capturing") as capturing,
+            patch.object(
+                dsv41_int8, "quantize_wo_a_inverse_rope", return_value=pair
+            ) as quantize,
+            patch.object(
+                dsv41_int8, "_project_unpacked", return_value=output
+            ) as project,
+        ):
+            args = (x, w, s, 8, 1024, freqs, positions)
+            for size, is_packed, is_capturing in (
+                (minimum - 1, False, False),
+                (minimum, True, False),
+                (minimum, False, True),
+            ):
+                x.numel.return_value = size
+                packed.return_value = is_packed
+                capturing.return_value = is_capturing
+                self.assertIsNone(dsv41_int8.try_project_wo_a_with_inverse_rope(*args))
+            quantize.assert_not_called()
+            project.assert_not_called()
+            capturing.return_value = False
+            self.assertIs(dsv41_int8.try_project_wo_a_with_inverse_rope(*args), output)
+            quantize.assert_called_once_with(x, freqs, positions)
+            project.assert_called_once_with(x, w, s, 8, 1024, input_quant_args=pair)
 
     def test_backend_lazily_binds_installed_kernel_once(self):
         ops = types.SimpleNamespace(**{name: Mock() for name in dsv41_int8._OPERATORS})
