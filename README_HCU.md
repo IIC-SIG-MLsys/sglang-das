@@ -67,6 +67,19 @@ pip install -e "python[srt]" --no-deps --no-build-isolation
 ## 验证
 - python -c "import sglang; print(sglang.\_\_version__)",
 
+### BW1000 DeepSeek-V4.1 FP4 Indexer
+
+在 `gfx936` 的 eager prefill 上，设置 `SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA=1`
+可为 dense batch 启用 HIP JIT 路径。每个有查询且 KV 非空的请求都需达到
+压缩后索引位置数门槛。候选源层默认为 81,920
+（`SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_SOURCE_MIN_K`），普通 dense 层默认为 131,072
+（`SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_MIN_K`）。开关默认值为 `0`，使用 LightOp。
+新路径每 8 个位置输出一个最大值，再对排名前
+512 的块重新打分以选出 512 个 token。候选源层另外生成 2,048 个块的表，优先
+保留包含最新位置的块。确定性推理、batch-invariant 模式、图捕获和候选消费层
+沿用既有路径。首次启用会验证 LightOp 的并列排序规则并编译 JIT，失败时回退
+到原有 dense 路径。
+
 ## 手动无人值守大模型测试
 
 仓库提供独立 workflow `Manual HCU Unattended Model Test`（文件：`.github/workflows/hcu-manual-model-test.yml`），用于在 HCU runner 上手动启动长时间模型验证任务。它只支持 `workflow_dispatch`，不会在 `pull_request`、`push` 或 `schedule` 时自动触发，因此不属于 PR gate。

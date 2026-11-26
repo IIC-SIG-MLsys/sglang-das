@@ -16,6 +16,7 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -646,7 +647,10 @@ class TestDSV41MQARowChunking(CustomTestCase):
         ).clamp_min(0)
         q_padded = F.pad(self.q, (0, 0, 0, 0, 0, 3))
         self.ns.update(
-            DSV4Metadata=SimpleNamespace, _as_int_list=lambda v: v, ForwardMode=Mode
+            DSV4Metadata=SimpleNamespace,
+            _as_int_list=lambda v: v,
+            ForwardMode=Mode,
+            envs=envs,
         )
         utils = types.ModuleType("sglang.srt.layers.attention.mqa_logits_utils")
         quant = types.ModuleType("sglang.kernels.ops.attention.dsv4.fp4_indexer")
@@ -671,12 +675,15 @@ class TestDSV41MQARowChunking(CustomTestCase):
                 batch = SimpleNamespace(seq_lens_cpu=self.lens, forward_mode=mode)
                 self.calls.clear()
                 self.previous = None
-                with patch.dict(
-                    sys.modules,
-                    {
-                        utils.__name__: utils,
-                        quant.__name__: quant,
-                    },
+                with (
+                    patch.dict(
+                        sys.modules,
+                        {
+                            utils.__name__: utils,
+                            quant.__name__: quant,
+                        },
+                    ),
+                    envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA.override(False),
                 ):
                     self.ns["_low_ratio_index_topk_dense"](
                         self.owner,
@@ -694,6 +701,117 @@ class TestDSV41MQARowChunking(CustomTestCase):
                 )
                 for got, want in zip((pages, raw), self.expected()):
                     torch.testing.assert_close(got, want)
+
+    def test_fused_source_slices_request_k_and_keeps_padding(self):
+        match = self.ns
+        load_functions(
+            ATTENTION / "deepseek_v4_backend.py",
+            {"_try_low_ratio_index_topk_fused"},
+            match,
+        )
+        match.update(
+            envs=envs,
+            get_disagg=lambda: SimpleNamespace(disaggregation_mode="prefill"),
+        )
+        deterministic = SimpleNamespace(enable_deterministic_inference=False)
+        match["get_exec"] = lambda: SimpleNamespace(deterministic=deterministic)
+        modes = SimpleNamespace(batch_invariant=False, capturing=False)
+        indexer = SimpleNamespace(
+            is_candidate_source=True,
+            index_topk=512,
+            candidate_block_size=8,
+            candidate_topk_blocks=2048,
+        )
+        q = torch.zeros((9, 32, 128), dtype=torch.bfloat16)
+        weights = torch.zeros((9, 32))
+        k = torch.arange(23, dtype=torch.int8).reshape(-1, 1)
+        pages = torch.full((12, 512), -1, dtype=torch.int32)
+        raw = torch.full_like(pages, -1)
+        observed = []
+
+        def fused(q, kv, weights, lengths, *, offsets, publish_blocks):
+            self.assertTrue(publish_blocks)
+            observed.append((kv[0][0, 0].item(), kv[0].shape[0], q.shape[0]))
+            tokens = torch.full((q.shape[0], 512), -1, dtype=torch.int32)
+            tokens[:, 0] = offsets
+            return tokens, torch.zeros((q.shape[0], 2048), dtype=torch.int32)
+
+        def finish(selected, slots, starts, out_pages, out_raw):
+            out_pages[:, 0] = slots[selected[:, 0].long()]
+            out_raw[:, 0] = selected[:, 0] - starts
+
+        modules = {
+            "sglang.kernels.ops.attention.dsv4.fused_fp4_mqa": SimpleNamespace(
+                BLOCK_SIZE=8,
+                MAX_QUERY_ROWS=65535,
+                SOURCE_TOPK=2048,
+                TOKEN_TOPK=512,
+                fused_fp4_mqa_available=lambda _: True,
+                fused_fp4_mqa_topk=fused,
+            ),
+            "sglang.kernels.ops.attention.dsv4.fp4_indexer": SimpleNamespace(
+                finish_flat_indexer_topk=finish
+            ),
+            "sglang.srt.batch_invariant_ops": SimpleNamespace(
+                is_batch_invariant_mode_enabled=lambda: modes.batch_invariant
+            ),
+            "sglang.srt.layers.attention.mqa_logits_utils": SimpleNamespace(
+                dsv41_mqa_logits_rows_per_chunk=lambda **_: 2
+            ),
+            "sglang.srt.model_executor.runner_utils.capture_mode": SimpleNamespace(
+                get_is_capture_mode=lambda: modes.capturing
+            ),
+        }
+        args = (
+            self.owner,
+            indexer,
+            q,
+            (k, k),
+            weights,
+            self.ks,
+            self.compress,
+            self.slots,
+            self.lens,
+            self.counts,
+            pages,
+            raw,
+        )
+        with (
+            patch.dict(sys.modules, modules),
+            envs.SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS.override(True),
+        ):
+            # The 11-key request qualifies, but the other live request has 9.
+            with envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_SOURCE_MIN_K.override(10):
+                self.assertFalse(match["_try_low_ratio_index_topk_fused"](*args))
+                self.assertFalse(observed)
+            with (
+                envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_SOURCE_MIN_K.override(9),
+                envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_MIN_K.override(12),
+            ):
+                indexer.is_candidate_source = False
+                self.assertFalse(match["_try_low_ratio_index_topk_fused"](*args))
+                indexer.is_candidate_source = True
+                deterministic.enable_deterministic_inference = True
+                self.assertFalse(match["_try_low_ratio_index_topk_fused"](*args))
+                self.assertFalse(observed)
+                deterministic.enable_deterministic_inference = False
+                for name in ("batch_invariant", "capturing"):
+                    setattr(modes, name, True)
+                    self.assertFalse(match["_try_low_ratio_index_topk_fused"](*args))
+                    self.assertFalse(observed)
+                    setattr(modes, name, False)
+                self.assertTrue(match["_try_low_ratio_index_topk_fused"](*args))
+        self.assertEqual(
+            observed, [(0, 11, 2), (0, 11, 2), (0, 11, 1), (14, 9, 2), (14, 9, 1)]
+        )
+        ids = self.owner.forward_metadata.candidate_metadata.request_block_ids
+        self.assertEqual(
+            [tensor.shape for tensor in ids], [(5, 2048), (0, 0), (3, 2048), (1, 0)]
+        )
+        torch.testing.assert_close(pages[:8, 0], self.slots[self.ks[:8].long()].int())
+        self.assertTrue((pages[8:] == -1).all())
+        self.assertTrue((raw[:8, 0] == 0).all())
+        self.assertTrue((raw[8:] == -1).all())
 
     def test_bounded_replay_tail_carries_compact_ids_including_empty_rank_rows(self):
         blocks = [
