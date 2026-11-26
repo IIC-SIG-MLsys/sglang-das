@@ -1,10 +1,11 @@
-"""Consume published Prefill candidates from the paged index-K pool on HCU.
+"""Score compact candidate rows during HCU prefill.
 
-The source layer and decode keep their existing paths.  This adapter only turns
-an existing candidate mask/table into sorted logical blocks, scores those blocks
-with FP32 head weights and logits, and restores the backend's sorted selections.
+The paged path reads the index-K cache directly. The BF16-Q fallback uses the
+gathered FP4 K to preserve the original scorer's head accumulation order.
 """
 
+import logging
+from functools import cache
 from typing import Callable, Optional
 
 import torch
@@ -23,6 +24,12 @@ SPARSE_BLOCK_KV = 8
 INVALID_BLOCK = torch.iinfo(torch.int32).max
 # Same floor as torch_quant.fake_quant_fp4, before the divide by six.
 FP4_AMAX_FLOOR = 6 * 2.0**-126
+logger = logging.getLogger(__name__)
+
+
+@cache
+def _log_prefill_candidate_route(route: str) -> None:
+    logger.info("DSV4.1 prefill candidate indexer: %s", route)
 
 
 def prefill_paged_sparse_enabled() -> bool:
@@ -413,6 +420,77 @@ def select_prefill_sparse_rows(
     return selected
 
 
+def select_prefill_compact_candidates(
+    *,
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    compress_lens: torch.Tensor,
+    k_slots: torch.Tensor,
+    candidate_blocks: list[torch.Tensor],
+    page_indices: torch.Tensor,
+    raw_indices: Optional[torch.Tensor],
+    index_topk: int,
+    budget_bytes: int,
+    max_rows: Optional[int],
+) -> None:
+    """Run the BF16 scorer and exact ragged TopK on ascending logical blocks."""
+    from sglang.kernels.ops.attention.dsv4.compact_fp4_candidate_logits import (
+        compact_fp4_candidate_logits,
+    )
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
+    from sglang.srt.layers.attention.dsv4.candidate_indexer import mask_topk_scores
+
+    _log_prefill_candidate_route("compact BF16-Q/FP4-K logits")
+    zero_offsets = torch.zeros_like(ks)
+    max_rows = min(max_rows or 65535, 65535)
+    offset = 0
+    for blocks in candidate_blocks:
+        rows, num_blocks = blocks.shape
+        if rows and num_blocks:
+            width = num_blocks * SPARSE_BLOCK_KV
+            step = min(max_rows, max(1, budget_bytes // (width * 4)))
+            for lo in range(0, rows, step):
+                hi = min(lo + step, rows)
+                query = slice(offset + lo, offset + hi)
+                block_chunk = blocks[lo:hi]
+                logits = compact_fp4_candidate_logits(
+                    q[query], kv, weights[query], ks[query], ke[query], block_chunk
+                )
+                selected = torch.empty(
+                    (hi - lo, index_topk), device=q.device, dtype=torch.int32
+                )
+                # Sorted unique IDs preserve the logical tie order. The valid
+                # compact prefix is at most min(causal length, compact width),
+                # even when source and consumer use different compression ratios.
+                topk_transform_ragged_v2(
+                    logits,
+                    compress_lens[query].clamp_max(width),
+                    out_offsets=zero_offsets[query],
+                    out_indices=selected,
+                )
+                selected = mask_topk_scores(logits, selected)
+                del logits
+                columns = selected.clamp_min(0)
+                logical = block_chunk.gather(1, (columns // SPARSE_BLOCK_KV).long())
+                logical.mul_(SPARSE_BLOCK_KV).add_(columns % SPARSE_BLOCK_KV)
+                logical = (
+                    logical.masked_fill_(selected < 0, INVALID_BLOCK).sort(-1).values
+                )
+                valid = logical != INVALID_BLOCK
+                absolute = (logical.long() + ks[query, None]).clamp_max(
+                    k_slots.numel() - 1
+                )
+                page_indices[query, :index_topk] = torch.where(
+                    valid, k_slots[absolute], -1
+                )
+                if raw_indices is not None:
+                    raw_indices[query, :index_topk] = torch.where(valid, logical, -1)
+        offset += rows
+
+
 def consume_prefill_candidate_sparse(
     *,
     pool,
@@ -437,30 +515,49 @@ def consume_prefill_candidate_sparse(
     There is no context-length dispatch threshold.  Capability/format checks
     precede Q preparation and any full-K gather.  Published masks are unchanged.
     """
-    if not indexer.uses_candidates or indexer.is_candidate_source:
+    if not getattr(indexer, "uses_candidates", False) or getattr(
+        indexer, "is_candidate_source", True
+    ):
         return False
-    if indexer.candidate_block_size != 8 or indexer.index_head_dim != 128:
+    head_dim = getattr(indexer, "index_head_dim", None)
+    if getattr(indexer, "candidate_block_size", None) != 8 or head_dim != 128:
         return False
-    if not 0 < indexer.n_local_heads <= 32 or indexer.n_local_heads % 4:
+    heads = getattr(indexer, "n_local_heads", None)
+    if heads is None or not 0 < heads <= 32 or heads % 4:
         return False
-    width = indexer.candidate_topk_blocks
-    if width <= 0 or width % 4 or width > 4096:
+    width = getattr(indexer, "candidate_topk_blocks", None)
+    if width is None or not 0 < width <= 4096 or width % 4:
         return False
     masks = getattr(candidate_metadata, "request_masks", None)
     retained = getattr(candidate_metadata, "request_block_ids", None)
     candidates = retained if retained is not None else masks
     if candidates is None or len(candidates) != len(rows_per_request):
         return False
+    get_page_size = getattr(pool, "get_index_k_page_size", None)
+    get_k_cache = getattr(pool, "get_index_k_with_scale_buffer", None)
+    wq_b = getattr(indexer, "wq_b", None)
+    rope_dim = getattr(indexer, "rope_head_dim", None)
+    index_topk = getattr(indexer, "index_topk", None)
+    if (
+        not callable(get_page_size)
+        or not callable(get_k_cache)
+        or not callable(wq_b)
+        or rope_dim is None
+        or index_topk is None
+        or index_topk <= 0
+    ):
+        return False
     functions = _lightop_functions()
     if functions is None:
+        _log_prefill_candidate_route("paged sparse LightOp API unavailable")
         return False
     if (
         len(lc_per_request) != len(rows_per_request)
         or sum(rows_per_request) != positions.numel()
     ):
         raise ValueError("ragged request rows do not match Prefill Q")
-    page_size = pool.get_index_k_page_size(compress_ratio)
-    if page_size <= 0 or page_size % 8:
+    page_size = get_page_size(compress_ratio)
+    if page_size is None or page_size <= 0 or page_size % 8:
         return False
     if positions.is_cuda:
         from sglang.srt.layers.attention.mqa_logits_utils import (
@@ -474,35 +571,41 @@ def consume_prefill_candidate_sparse(
         )
         if budget_rows is not None:
             budget_bytes = min(budget_bytes, budget_rows * width * SPARSE_BLOCK_KV * 4)
-    k_cache = pool.get_index_k_with_scale_buffer(layer_id)
+    k_cache = get_k_cache(layer_id)
     if k_cache is None:
         return False
     k_cache = k_cache.view(k_cache.shape[0], page_size, 1, 68)
     fused_consumer = _lightop_fused_consumer(x)
-    retained = getattr(candidate_metadata, "request_block_ids", None)
+    head_weights_raw = getattr(indexer, "head_weights_raw", None)
+    weight_scale = getattr(indexer, "head_weight_scale", None)
     if (
         fused_consumer is not None
         and retained is not None
-        and callable(getattr(indexer, "head_weights_raw", None))
-        and indexer.index_topk in (512, 1024, 2048)
+        and callable(head_weights_raw)
+        and weight_scale is not None
+        and index_topk in (512, 1024, 2048)
     ):
+        _log_prefill_candidate_route("LightOp fused paged sparse")
         # Fused writeback covers every live output cell. Preserve any padding
         # owned by the backend without clearing the live matrix first.
         for output in (page_indices, raw_indices):
             if output is None:
                 continue
             if output.shape[0] > positions.numel():
-                output[positions.numel():].fill_(-1)
-            if output.shape[1] > indexer.index_topk:
-                output[:positions.numel(), indexer.index_topk:].fill_(-1)
+                output[positions.numel() :].fill_(-1)
+            if output.shape[1] > index_topk:
+                output[: positions.numel(), index_topk:].fill_(-1)
         # Keep both GEMMs and the exact BF16 weight-rounding contract.
-        raw_weights = indexer.head_weights_raw(x)
-        q, _ = indexer.wq_b(q_lora)
-        q = q.view(positions.numel(), indexer.n_local_heads, indexer.index_head_dim)
+        raw_weights = head_weights_raw(x)
+        q, _ = wq_b(q_lora)
+        q = q.view(positions.numel(), heads, head_dim)
         fused_consumer(
-            q, raw_weights, freqs_cis, positions,
-            weight_scale=indexer.head_weight_scale,
-            rope_dim=indexer.rope_head_dim,
+            q,
+            raw_weights,
+            freqs_cis,
+            positions,
+            weight_scale=weight_scale,
+            rope_dim=rope_dim,
             k_cache=k_cache,
             req_to_token=req_to_token,
             request_pool_indices=request_pool_indices,
@@ -512,13 +615,17 @@ def consume_prefill_candidate_sparse(
             compress_ratio=compress_ratio,
             page_size=page_size,
             num_max_sparse_blocks=width,
-            index_topk=indexer.index_topk,
+            index_topk=index_topk,
             out_page_indices=page_indices,
             out_raw_indices=raw_indices,
             budget_bytes=budget_bytes,
         )
         return True
+    head_weights = getattr(indexer, "head_weights", None)
+    if not callable(head_weights):
+        return False
     # The original adapter needs -1 for skipped requests and output padding.
+    _log_prefill_candidate_route("LightOp paged sparse")
     page_indices.fill_(-1)
     if raw_indices is not None:
         raw_indices.fill_(-1)
@@ -537,7 +644,6 @@ def consume_prefill_candidate_sparse(
     )
     prepared = cache.get(key)
     if prepared is None:
-        retained = getattr(candidate_metadata, "request_block_ids", None)
         prepared = []
         for request, (length, count) in enumerate(
             zip(lc_per_request, rows_per_request)
@@ -585,10 +691,10 @@ def consume_prefill_candidate_sparse(
         cache[key] = prepared
     # Preserve the current weight calculation and BF16 multiply-before-float
     # order; do not substitute raw projection weights scaled in FP32.
-    weights = indexer.head_weights(x).float().contiguous()
-    q, _ = indexer.wq_b(q_lora)
-    q = q.view(positions.numel(), indexer.n_local_heads, indexer.index_head_dim)
-    q_fp4, q_sf = pack_prefill_query(q, freqs_cis, positions, indexer.rope_head_dim)
+    weights = head_weights(x).float().contiguous()
+    q, _ = wq_b(q_lora)
+    q = q.view(positions.numel(), heads, head_dim)
+    q_fp4, q_sf = pack_prefill_query(q, freqs_cis, positions, rope_dim)
     lengths = ((positions + 1) // compress_ratio).to(torch.int32)
     offset = 0
     for request, (count, operands) in enumerate(zip(rows_per_request, prepared)):
@@ -603,7 +709,7 @@ def consume_prefill_candidate_sparse(
                 blocks=blocks,
                 paged_table=pages[None, :].expand(count, -1),
                 context_lens=lengths[offset:end],
-                index_topk=indexer.index_topk,
+                index_topk=index_topk,
                 budget_bytes=budget_bytes,
                 schedule_fn=functions[0],
                 logits_fn=functions[1],
@@ -617,10 +723,10 @@ def consume_prefill_candidate_sparse(
                 selected.clamp_min(0).to(torch.int64) * compress_ratio,
             ]
             slots = slots.to(torch.int64) // compress_ratio
-            page_indices[offset:end, : indexer.index_topk] = torch.where(
-                chosen, slots, -1
-            ).to(torch.int32)
+            page_indices[offset:end, :index_topk] = torch.where(chosen, slots, -1).to(
+                torch.int32
+            )
             if raw_indices is not None:
-                raw_indices[offset:end, : indexer.index_topk] = selected
+                raw_indices[offset:end, :index_topk] = selected
         offset = end
     return True

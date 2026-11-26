@@ -166,7 +166,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
         )
         load_functions(
             ATTENTION / "dsv4/candidate_indexer.py",
-            {"select_candidate_blocks"},
+            {"mask_topk_scores", "select_candidate_blocks"},
             self.ns,
         )
         load_functions(
@@ -324,6 +324,19 @@ class TestDSV41MQARowChunking(CustomTestCase):
 
     def test_source_keeps_only_compact_ids_and_releases_logits_views(self):
         self.indexer.is_candidate_source = True
+        base_topk = self.ns["topk_transform_ragged_v2"]
+
+        def topk(scores, *args, **kwargs):
+            # The native boundary already returned clean window-local logits.
+            self.assertEqual(scores._version, self.score_version)
+            base_topk(scores, *args, **kwargs)
+
+        def scorer(*args, **kwargs):
+            scores = self.kernel(*args, **kwargs)
+            self.score_version = scores._version
+            return scores
+
+        self.ns.update(_hcu_dense_fp4_mqa_logits=scorer, topk_transform_ragged_v2=topk)
         for step in (2, 4, 20):
             result = self.run_chunked(step)
             for got, want in zip(result, self.expected()):
@@ -346,6 +359,102 @@ class TestDSV41MQARowChunking(CustomTestCase):
                 )
                 torch.testing.assert_close(got, expected)
             offset += count
+
+    def test_compact_topk_preserves_ragged_positions_ties_and_slot_mapping(self):
+        ns = dict(
+            torch=torch,
+            INVALID_BLOCK=torch.iinfo(torch.int32).max,
+            SPARSE_BLOCK_KV=8,
+            _log_prefill_candidate_route=lambda _: None,
+        )
+        load_functions(
+            ATTENTION / "dsv4/prefill_sparse_lightop.py",
+            {"select_prefill_compact_candidates"},
+            ns,
+        )
+        # Use rank-local rows from a cached prefix. The first request's table
+        # omits the newest block on some rows, as can happen across ratios.
+        for ratio in (1, 2):
+            for cp_size in (1, 8):
+                with self.subTest(ratio=ratio, cp_size=cp_size):
+                    positions = torch.arange(12 * ratio, 29 * ratio)[::cp_size]
+                    lens = torch.cat(
+                        ((positions + 1) // ratio, torch.tensor([1, 0]))
+                    ).int()
+                    count = positions.numel()
+                    ks = torch.tensor([0] * count + [29, 30], dtype=torch.int32)
+                    blocks = [
+                        torch.tensor([0, 2], dtype=torch.int32).expand(count, -1),
+                        torch.tensor([[0, -1]], dtype=torch.int32),
+                        torch.empty(1, 0, dtype=torch.int32),
+                    ]
+                    # Distinct physical slots and ties exactly at the selection floor.
+                    slots = torch.arange(30, 0, -1, dtype=torch.int64) * 7
+                    values = torch.arange(30).remainder(3).float()
+                    q = torch.zeros(lens.numel(), 32, 128)
+                    pages = torch.full((lens.numel() + 2, 6), -1, dtype=torch.int32)
+                    raw = torch.full_like(pages, -1)
+
+                    def compact_logits(q, kv, weights, starts, ends, table):
+                        self.assertLessEqual(q.shape[0], 2)
+                        local = (table[:, :, None] * 8 + torch.arange(8)).flatten(1)
+                        indices = local + starts[:, None]
+                        valid = (local >= 0) & (indices < ends[:, None])
+                        return values[indices.clamp(0, 29)].masked_fill(
+                            ~valid, -torch.inf
+                        )
+
+                    def topk(logits, lens, out_offsets, out_indices):
+                        out_indices.fill_(-1)
+                        for b, length in enumerate(lens.tolist()):
+                            ids = logits[b, :length].argsort(
+                                descending=True, stable=True
+                            )[:5]
+                            out_indices[b, : ids.numel()] = ids + out_offsets[b]
+
+                    kernels = "sglang.kernels.ops.attention.dsv4"
+                    scorer = types.ModuleType(f"{kernels}.compact_fp4_candidate_logits")
+                    scorer.compact_fp4_candidate_logits = compact_logits
+                    topk_module = types.ModuleType(f"{kernels}.topk")
+                    topk_module.topk_transform_ragged_v2 = topk
+                    candidate = types.ModuleType(
+                        "sglang.srt.layers.attention.dsv4.candidate_indexer"
+                    )
+                    candidate.mask_topk_scores = self.ns["mask_topk_scores"]
+                    with patch.dict(
+                        sys.modules,
+                        {m.__name__: m for m in (scorer, topk_module, candidate)},
+                    ):
+                        ns["select_prefill_compact_candidates"](
+                            q=q,
+                            kv=None,
+                            weights=torch.ones_like(q[:, :, 0]),
+                            ks=ks,
+                            ke=ks + lens,
+                            compress_lens=lens,
+                            k_slots=slots,
+                            candidate_blocks=blocks,
+                            page_indices=pages,
+                            raw_indices=raw,
+                            index_topk=5,
+                            budget_bytes=16 * 4 * 2,
+                            max_rows=None,
+                        )
+
+                    expected_raw = torch.full_like(raw, -1)
+                    expected_pages = torch.full_like(pages, -1)
+                    for row, length in enumerate(lens.tolist()):
+                        kept = [
+                            i for i in range(length) if row >= count or i // 8 in (0, 2)
+                        ]
+                        ranked = sorted(kept, key=lambda i: -values[ks[row] + i])[:5]
+                        picks = torch.tensor(sorted(ranked), dtype=torch.long)
+                        expected_raw[row, : len(ranked)] = picks.int()
+                        expected_pages[row, : len(ranked)] = slots[
+                            ks[row] + picks
+                        ].int()
+                    self.assertTrue(torch.equal(raw, expected_raw))
+                    self.assertTrue(torch.equal(pages, expected_pages))
 
     def test_consumers_support_compact_ids_and_original_masks(self):
         self.indexer.is_candidate_source = True
@@ -596,7 +705,9 @@ class TestDSV41MQARowChunking(CustomTestCase):
             candidate_metadata=Candidates(request_block_ids=blocks),
             core_attn_metadata=SimpleNamespace(),
         )
-        tail = SimpleNamespace(cp_metadata=None, extend_seq_lens_cpu=[2, 0, 0])
+        tail = SimpleNamespace(
+            cp_metadata=None, extend_seq_lens_cpu=[2, 0, 0], real_rows_count=None
+        )
         new = SimpleNamespace(
             late_layer_tail=tail, core_attn_metadata=SimpleNamespace(low_ratios=[])
         )
@@ -609,7 +720,12 @@ class TestDSV41MQARowChunking(CustomTestCase):
             get_local_dp_buffer_len=lambda: 10,
             is_cp_cache_layer_split_deepseek_v4_pool=lambda pool: False,
         )
-        batch = SimpleNamespace(attn_cp_metadata=None)
+        batch = SimpleNamespace(
+            attn_cp_metadata=None,
+            global_num_token_non_padded_cpu=None,
+            global_num_token_non_padded=None,
+            num_token_non_padded=None,
+        )
         saved = self.ns["enter_late_layer_tail"](owner, batch)
         self.assertIs(saved[0], old)
         self.assertIs(owner.forward_metadata, new)
@@ -635,7 +751,8 @@ class TestDSV41MQARowChunking(CustomTestCase):
         utils = types.ModuleType("sglang.srt.layers.attention.mqa_logits_utils")
         utils.dsv41_mqa_logits_rows_per_chunk = budget
         ns.update(_lightop_functions=lambda: (None, None, None),
-                  _lightop_fused_consumer=lambda x: native)
+                  _lightop_fused_consumer=lambda x: native,
+                  _log_prefill_candidate_route=lambda _: None)
         indexer = SimpleNamespace(
             uses_candidates=True, is_candidate_source=False,
             candidate_block_size=8, index_head_dim=128, n_local_heads=32,
@@ -680,6 +797,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
         ns.update(
             _lightop_functions=lambda: (None, None, None),
             _lightop_fused_consumer=lambda x: native,
+            _log_prefill_candidate_route=lambda _: None,
         )
         pages = torch.zeros(4, 513, dtype=torch.int32)
         raw = torch.zeros_like(pages)
