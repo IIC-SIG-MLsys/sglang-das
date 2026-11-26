@@ -37,6 +37,7 @@ from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
 from sglang.srt.runtime_context import get_serving
+from sglang.srt.utils.json_response import format_sse_json
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 from sglang.utils import convert_json_schema_to_str
 
@@ -371,7 +372,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         code.name,
                         code.value,
                     )
-                    yield f"data: {error}\n\n"
+                    yield format_sse_json(error)
                     break
 
                 choice_data = CompletionResponseStreamChoice(
@@ -403,7 +404,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         reasoning_tokens=reasoning_tokens.get(index, 0),
                     )
 
-                yield f"data: {chunk.model_dump_json()}\n\n"
+                yield format_sse_json(chunk.model_dump_json())
                 stream_started = True
 
             if request.return_hidden_states and hidden_states:
@@ -426,7 +427,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             ],
                             model=request.model,
                         )
-                        yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
+                        yield format_sse_json(hidden_states_chunk.model_dump_json())
 
             sglext_routed = None
             if request.return_routed_experts and routed_experts:
@@ -476,7 +477,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         spec_tokens_details=sglext_spec_tokens_details,
                     ),
                 )
-                yield f"data: {sglext_chunk.model_dump_json()}\n\n"
+                yield format_sse_json(sglext_chunk.model_dump_json())
 
             # Handle final usage chunk
             if include_usage:
@@ -496,13 +497,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     usage=usage,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(exclude_none=True)
-                yield f"data: {final_usage_data}\n\n"
+                yield format_sse_json(final_usage_data)
 
         except Exception as e:
             if not stream_started:
                 raise
             error = self.create_streaming_error_response(str(e))
-            yield f"data: {error}\n\n"
+            yield format_sse_json(error)
 
         yield "data: [DONE]\n\n"
 
