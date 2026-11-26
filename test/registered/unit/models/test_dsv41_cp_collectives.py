@@ -1,6 +1,7 @@
 """CPU coverage for the HCU LayerSplit CP layout and projection payload."""
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -45,12 +46,14 @@ class TestDsv41CPCollectives(CustomTestCase):
         self.attn = backend.DeepseekV4AttnBackend.__new__(backend.DeepseekV4AttnBackend)
         self.attn.token_to_kv_pool = self.pool
         self.attn.forward_metadata = backend.DSV4Metadata(None, None)
-        self.enterContext(
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
             patch.object(
                 dsa_utils, "is_dsa_prefill_cp_round_robin_split", return_value=True
             )
         )
-        self.enterContext(
+        stack.enter_context(
             patch.object(torch.cuda, "is_current_stream_capturing", return_value=False)
         )
 
