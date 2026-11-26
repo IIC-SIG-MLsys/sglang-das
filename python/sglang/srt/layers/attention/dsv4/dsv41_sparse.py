@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 from sglang.kernels.ops.attention.dsv4.torch_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
+    rope_tail,
 )
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
@@ -31,7 +32,11 @@ _use_indexer_prep = (
     _is_hcu and os.environ.get("SGLANG_HCU_OPT_INDEXER_PREP", "1") == "1"
 )
 if _use_indexer_prep:
-    from lightop.attention import dsv41_indexer_rope_fake_quant
+    try:
+        from lightop.attention import dsv41_indexer_rope_fake_quant
+    except ImportError:
+        dsv41_indexer_rope_fake_quant = None
+        _use_indexer_prep = False
 
 
 def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
@@ -148,18 +153,6 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     return torch.repeat_interleave(
         req, forward_batch.extend_seq_lens.to(torch.int64), output_size=num_tokens
     )
-
-
-def rope_tail(
-    x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, inverse: bool = False
-) -> torch.Tensor:
-    """Rotate the last rope_dim features of x with complex freqs [T, rope_dim // 2]."""
-    head, tail = x[..., :-rope_dim], x[..., -rope_dim:]
-    tc = torch.view_as_complex(tail.float().unflatten(-1, (-1, 2)).contiguous())
-    f = freqs.conj() if inverse else freqs
-    f = f.view(x.shape[0], *([1] * (x.ndim - 2)), rope_dim // 2)
-    rotated = torch.view_as_real(tc * f).flatten(-2).to(x.dtype)
-    return torch.cat([head, rotated], dim=-1)
 
 
 def fused_low_ratio_compress_supported() -> bool:

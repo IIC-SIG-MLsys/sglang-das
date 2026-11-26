@@ -83,12 +83,19 @@ def enabled(quant_config, *, model_path=None):
     return checkpoint_supports_channelwise_fp8(str(model_path))
 
 
+def _quantize_rows(x):
+    try:
+        from lightop.quant import per_token_quant_fp8
+    except ImportError:
+        from sglang.kernels.ops.quantization.fp8_kernel import per_token_quant_fp8
+    return per_token_quant_fp8(x)
+
+
 def linear(x, weight, scale, *, output_dtype=None, out=None, quantized=None):
     """FP8 projection. ``quantized=(xq, xs)`` supplies activations that are
     already per-token quantized in the layout of ``x`` (``x`` then only
     carries the shape), so the caller controls where the quantization runs."""
     import deepgemm
-    from lightop.quant import per_token_quant_fp8
 
     if weight.dtype != torch.float8_e4m3fn or scale.shape != weight.shape[:-1] + (1,):
         raise ValueError(
@@ -108,7 +115,7 @@ def linear(x, weight, scale, *, output_dtype=None, out=None, quantized=None):
         return output
     if quantized is None:
         x = x.contiguous()
-        xq, xs = per_token_quant_fp8(x)
+        xq, xs = _quantize_rows(x)
     else:
         xq, xs = quantized
     # The installed hipBLASLt dispatch is extremely slow for full-vocabulary
@@ -175,16 +182,24 @@ def transform_quant_available():
     if torch.version.hip is None:
         return False
     try:
+        from lightop.quant import per_token_quant_fp8
         from lightop.quant.fp8 import PER_TOKEN_QUANT_FP8_VERSION
         from lightop.quant.transforms import is_transform_quant_available
     except (ImportError, OSError, RuntimeError):
         return False
-    return is_transform_quant_available() and PER_TOKEN_QUANT_FP8_VERSION >= 2
+    return (
+        PER_TOKEN_QUANT_FP8_VERSION >= 2
+        and callable(per_token_quant_fp8)
+        and is_transform_quant_available()
+    )
 
 
 def rope_grouped_input(x, frequencies, positions, groups, rope_dim):
     """Emit group-major FP8 directly; model initialization checks kernel support."""
-    from lightop.quant import rope_per_token_quant
+    try:
+        from lightop.quant import rope_per_token_quant
+    except ImportError:
+        return None
 
     if (
         x.dtype not in (torch.bfloat16, torch.float16)
@@ -212,19 +227,20 @@ def grouped(x, layer, groups, rank, *, quantized=None, quantize_output=False):
         xq, xs = quantized
         y = linear(xq, weight, scale, output_dtype=x.dtype, quantized=(xq, xs))
     elif x.dim() == 3 and x.is_contiguous() and x.numel() > 0:
-        from lightop.quant import per_token_quant_fp8
-
         tokens, n_groups, dim = x.shape
-        xq, xs = per_token_quant_fp8(x.view(tokens * n_groups, dim))
+        xq, xs = _quantize_rows(x.view(tokens * n_groups, dim))
         xq = _swap01_contiguous(xq.view(tokens, n_groups, dim))
         xs = xs.view(tokens, n_groups, 1).transpose(0, 1).contiguous()
         y = linear(xq, weight, scale, output_dtype=x.dtype, quantized=(xq, xs))
     else:
         y = linear(x.transpose(0, 1).contiguous(), weight, scale)
     if quantize_output and x.shape[0] > 0:
-        from lightop.quant import per_token_quant_fp8
+        if transform_quant_available():
+            from lightop.quant import per_token_quant_fp8
 
-        q, scales = per_token_quant_fp8(y.transpose(0, 1), quant_ndim=2)
+            q, scales = per_token_quant_fp8(y.transpose(0, 1), quant_ndim=2)
+        else:
+            q, scales = _quantize_rows(_swap01_contiguous(y).flatten(1))
         return q, scales, x.dtype
     return _swap01_contiguous(y)
 

@@ -174,6 +174,7 @@ class TestDSV41MQARowChunking(CustomTestCase):
             ATTENTION / "deepseek_v4_backend.py",
             {
                 "_prefill_candidate_mask",
+                "_finish_low_ratio_topk",
                 "_low_ratio_index_topk_chunked",
                 "_publish_or_consume_candidates",
                 "_low_ratio_index_topk_dense",
@@ -853,6 +854,14 @@ class TestDSV41MQARowChunking(CustomTestCase):
                 indexer.is_candidate_source = False
                 self.assertFalse(match["_try_low_ratio_index_topk_fused"](*args))
                 indexer.is_candidate_source = True
+                # Skipping publication runs the dense profile: 9 keys meet the
+                # source crossover but fall short of the 12-key dense crossover.
+                self.assertFalse(
+                    match["_try_low_ratio_index_topk_fused"](
+                        *args, skip_candidate_op=True
+                    )
+                )
+                self.assertFalse(observed)
                 deterministic.enable_deterministic_inference = True
                 self.assertFalse(match["_try_low_ratio_index_topk_fused"](*args))
                 self.assertFalse(observed)
@@ -898,9 +907,12 @@ class TestDSV41MQARowChunking(CustomTestCase):
             ):
                 torch.testing.assert_close(got, all_ids[all_ids.shape[0] - count :])
             publication.clear()
-            self.assertTrue(
-                match["_try_low_ratio_index_topk_fused"](*args, skip_candidate_op=True)
-            )
+            with envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_MIN_K.override(9):
+                self.assertTrue(
+                    match["_try_low_ratio_index_topk_fused"](
+                        *args, skip_candidate_op=True
+                    )
+                )
             self.assertEqual(publication, [False] * 8)
             self.assertIsNone(self.owner.forward_metadata.candidate_metadata)
             torch.testing.assert_close(

@@ -919,9 +919,12 @@ class DeepSeekV4IndexerPool(KVCache):
         assert self.use_fp4_indexer, "packed readback only applies to the fp4 layout"
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         if use_hcu_fused_gather:
-            from lightop import dsv41_gather_index_k_fp4
-
-            return dsv41_gather_index_k_fp4(buf, slots, self.page_size)
+            try:
+                from lightop import dsv41_gather_index_k_fp4
+            except ImportError:
+                pass
+            else:
+                return dsv41_gather_index_k_fp4(buf, slots, self.page_size)
         if buf.is_cuda:
             from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
                 gather_fp4_index_k,

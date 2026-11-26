@@ -263,6 +263,8 @@ class TestDsv41CompactFp4CandidateLogits(CustomTestCase):
                         "SGLANG_HCU_PREFILL_PAGED_SPARSE": "0",
                         "SGLANG_HCU_OPT_DSV41_CANDIDATE_LOGITS": "1",
                         "SGLANG_USE_LIGHTOP_DSV41_CANDIDATE_BLOCKS": "1",
+                        # Exercise consumption even when the window covers all keys.
+                        "SGLANG_HCU_OPT_DSV41_PREFILL_CONSUMER_40352": "0",
                     },
                 ),
             ):

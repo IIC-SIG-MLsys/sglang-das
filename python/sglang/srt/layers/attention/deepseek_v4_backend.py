@@ -256,9 +256,11 @@ def _supports_index_k_rope_pack() -> bool:
 @functools.lru_cache(maxsize=1)
 def _get_cp_pool_pairs_norm():
     """Keep the unfused path usable with LightOp builds lacking this API."""
-    import lightop
-
-    return getattr(lightop, "dsv41_pool_pairs_norm", None)
+    try:
+        from lightop import dsv41_pool_pairs_norm
+    except ImportError:
+        return None
+    return dsv41_pool_pairs_norm
 
 
 def _supports_index_q_rope_pack() -> bool:
@@ -648,6 +650,32 @@ def _prefill_candidate_mask(candidate, request, rows, width, block_size):
         1, torch.where((blocks >= 0) & (blocks < nblocks), blocks, nblocks), True
     )
     return keep[:, :nblocks].repeat_interleave(block_size, dim=1)[:, :width]
+
+
+def _finish_low_ratio_topk(
+    logits, selected, ks, k_slots, page_indices, raw_indices, mask_scores
+):
+    if _is_hcu:
+        try:
+            from lightop.attention import dsv41_ragged_topk_postprocess
+        except ImportError:
+            pass
+        else:
+            dsv41_ragged_topk_postprocess(
+                logits, selected, ks, k_slots, page_indices, raw_indices, mask_scores
+            )
+            return
+    if mask_scores:
+        selected = mask_topk_scores(logits, selected, ks)
+    # Consumers expect ascending positions with padding last.
+    unselected = torch.iinfo(torch.int32).max
+    selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
+    chosen = selected != unselected
+    page_indices.copy_(
+        torch.where(chosen, k_slots[selected.clamp_max(k_slots.shape[0] - 1)], -1)
+    )
+    if raw_indices is not None:
+        raw_indices.copy_(torch.where(chosen, selected - ks[:, None], -1))
 
 
 def _hcu_mqa_prep_available() -> bool:
@@ -2573,14 +2601,15 @@ class DeepseekV4AttnBackend(
                 token_indices=token_indices,
                 contiguous_start=contiguous_start,
             )
-        if any(n > SWA_WINDOW for n in tail_lens_cpu):
-            # Prompt logprobs or full hidden states may retain the whole extend.
+        extend_seq_lens = getattr(forward_batch, "extend_seq_lens", None)
+        if extend_seq_lens is None or any(n > SWA_WINDOW for n in tail_lens_cpu):
+            # CPU-only metadata and whole-extend replay both use the host lengths.
             tail_lens = torch.tensor(
                 tail_lens_cpu, dtype=torch.int32, device="cpu",
                 pin_memory=device.type == "cuda",
             ).to(device, non_blocking=True)
         else:
-            tail_lens = forward_batch.extend_seq_lens.clamp(max=SWA_WINDOW).to(torch.int32)
+            tail_lens = extend_seq_lens.clamp(max=SWA_WINDOW).to(torch.int32)
         cp_tail = (
             self._late_layer_tail_cp_layout(forward_batch, token_indices, tail_lens_cpu)
             if legacy_cp or is_cp_active(forward_batch)
@@ -4803,11 +4832,15 @@ class DeepseekV4AttnBackend(
             return kv, score
 
         if _is_hcu and os.environ.get("SGLANG_HCU_OPT_DSV41_PAIR_PARTNERS", "1") == "1":
-            from lightop.attention import dsv41_pair_partners
-
-            return dsv41_pair_partners(
-                kv, score, req, pos, pad, state.kv_score_buffer.kv_score, ring
-            )
+            try:
+                from lightop.attention import dsv41_pair_partners
+            except ImportError:
+                if "SGLANG_HCU_OPT_DSV41_PAIR_PARTNERS" in os.environ:
+                    raise
+            else:
+                return dsv41_pair_partners(
+                    kv, score, req, pos, pad, state.kv_score_buffer.kv_score, ring
+                )
 
         read_pos = (pos - 1).masked_fill(pad, -1)
         carried = state.get_state_by_state_loc(
@@ -5285,13 +5318,15 @@ class DeepseekV4AttnBackend(
 
             if hcu_prefill_40352_enabled():
                 skip_candidate_op = cand_window_covers_all(indexer, lc_per_req) or (
-                    indexer.is_candidate_source and self.skip_late_layers
+                    indexer.is_candidate_source
+                    and getattr(self, "skip_late_layers", False)
                 )
                 if indexer.is_candidate_source:
                     if skip_candidate_op:
                         self.forward_metadata.candidate_metadata = None
-                        if self.tail_forward_metadata is not None:
-                            self.tail_forward_metadata.candidate_metadata = None
+                        tail_meta = getattr(self, "tail_forward_metadata", None)
+                        if tail_meta is not None:
+                            tail_meta.candidate_metadata = None
                     else:
                         tail_target = get_late_tail_publish_target(self, q_lens_cpu)
         empty_mask = (
@@ -5406,7 +5441,7 @@ class DeepseekV4AttnBackend(
                 use_hcu_fused_gather=self.dsv41_hcu_indexer_kernels,
             )
 
-        if self.fuse_indexer_q_prep:
+        if getattr(self, "fuse_indexer_q_prep", False):
             q = indexer.queries(q_lora, layer.freqs_cis, positions=pos)
         else:
             q = indexer.queries(q_lora, layer.freqs_cis[pos])  # [T, H, 128] fp4 grid
@@ -5582,34 +5617,17 @@ class DeepseekV4AttnBackend(
         topk_transform_ragged_v2(
             logits, compress_lens, out_offsets=ks, out_indices=selected
         )
-        if _is_hcu:
-            from lightop.attention import dsv41_ragged_topk_postprocess
-
-            dsv41_ragged_topk_postprocess(
-                logits,
-                selected,
-                ks,
-                k_slots,
-                page_indices[:num_tokens, :topk],
-                raw_indices[:num_tokens, :topk] if raw_indices is not None else None,
-                indexer.uses_candidates
-                and not indexer.is_candidate_source
-                and not skip_candidate_op,
-            )
-            return
-        if indexer.uses_candidates and not indexer.is_candidate_source:
-            selected = mask_topk_scores(logits, selected, ks)
-        # ascending positions, padding last: the layout the consumers expect
-        unselected = torch.iinfo(torch.int32).max
-        selected = selected.masked_fill(selected < 0, unselected).sort(dim=-1).values
-        chosen = selected != unselected
-        page_indices[:num_tokens, :topk] = torch.where(
-            chosen, k_slots[selected.clamp_max(k_slots.shape[0] - 1)], -1
-        ).to(torch.int32)
-        if raw_indices is not None:
-            raw_indices[:num_tokens, :topk] = torch.where(
-                chosen, selected - ks[:, None], -1
-            )
+        _finish_low_ratio_topk(
+            logits,
+            selected,
+            ks,
+            k_slots,
+            page_indices[:num_tokens, :topk],
+            raw_indices[:num_tokens, :topk] if raw_indices is not None else None,
+            indexer.uses_candidates
+            and not indexer.is_candidate_source
+            and not skip_candidate_op,
+        )
 
     def _try_low_ratio_index_topk_fused(
         self,
@@ -5628,11 +5646,10 @@ class DeepseekV4AttnBackend(
         skip_candidate_op=False,
         tail_target=None,
     ) -> bool:
-        source = indexer.is_candidate_source
-        publish_blocks = source and not skip_candidate_op
+        publish_blocks = indexer.is_candidate_source and not skip_candidate_op
         min_keys = (
             envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_SOURCE_MIN_K
-            if source
+            if publish_blocks
             else envs.SGLANG_HCU_OPT_DSV41_FUSED_FP4_MQA_MIN_K
         ).get()
         # Keep batches with a short live request on the shared LightOp path.
@@ -5779,8 +5796,6 @@ class DeepseekV4AttnBackend(
         tail_target=None,
     ) -> None:
         """Tile native window-local logits with ke == ks + compress_lens."""
-        from lightop.attention import dsv41_ragged_topk_postprocess
-
         topk = indexer.index_topk
         width = ceil_align(max(lc_per_req), 4)
         publish_lens_cpu = tail_target[1] if tail_target is not None else q_lens_cpu
@@ -5888,7 +5903,7 @@ class DeepseekV4AttnBackend(
                 out_offsets=ks[rows],
                 out_indices=selected,
             )
-            dsv41_ragged_topk_postprocess(
+            _finish_low_ratio_topk(
                 logits,
                 selected,
                 ks[rows],
@@ -6603,11 +6618,12 @@ class DeepseekV4AttnBackend(
         extra_topk = 0 if extra_indices is None else extra_indices.shape[-1]
 
         if self._dsv4_lightop_bf16_gather:
-            import lightop.kvcache as lightop_kvcache
-
-            compact_gather = getattr(
-                lightop_kvcache, "dsv4_gather_upconvert_compact_k_cache_paged", None
-            )
+            try:
+                from lightop.kvcache import (
+                    dsv4_gather_upconvert_compact_k_cache_paged as compact_gather,
+                )
+            except ImportError:
+                return None
             common = (
                 swa_k_cache.is_cuda
                 and swa_k_cache.shape[1] == 256

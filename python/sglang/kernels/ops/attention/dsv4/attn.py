@@ -104,9 +104,21 @@ def fused_store_cache(
         # HCU compressed KV keeps the RoPE -> BF16 -> fake FP4 -> BF16
         # sequence before its physical V4 FP8/BF16 cache quantization.
         assert type == "flashmla", "compressed-KV RoPE fusion is not an indexer store"
-        from lightop import dsv41_rope_fake_quant_store
+        try:
+            from lightop import dsv41_rope_fake_quant_store
+        except ImportError:
+            from .torch_quant import fake_quant_compressed_kv, rope_tail
 
-        return dsv41_rope_fake_quant_store(input, freqs_cis, cache, indices, page_size)
+            if not freqs_cis.is_complex():
+                freqs_cis = torch.view_as_complex(
+                    freqs_cis.unflatten(-1, (32, 2)).contiguous()
+                )
+            input = fake_quant_compressed_kv(rope_tail(input, freqs_cis, 64))
+            freqs_cis = None  # The ordinary V4 writer consumes the finished latent.
+        else:
+            return dsv41_rope_fake_quant_store(
+                input, freqs_cis, cache, indices, page_size
+            )
     if is_hip_runtime() and layout is KVLayout.V4:
         assert freqs_cis is None, "the V4 store receives already-rotated inputs"
 

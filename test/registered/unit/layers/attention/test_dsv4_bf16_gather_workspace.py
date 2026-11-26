@@ -368,23 +368,30 @@ class TestBF16GatherWorkspace(unittest.TestCase):
         old_package.kvcache = old_kvcache
         indices = torch.zeros((2, 1, 8), dtype=torch.int32)
         lengths = torch.full((2,), 8, dtype=torch.int32)
-        with patch.dict(
-            sys.modules, {"lightop": old_package, "lightop.kvcache": old_kvcache}
-        ):
-            with patch.object(
-                torch.cuda, "is_current_stream_capturing", return_value=False
+        args = dict(
+            swa_k_cache=torch.zeros((1, 256, 1, 584), dtype=torch.uint8),
+            swa_indices=indices,
+            swa_topk_lengths=lengths,
+            extra_k_cache=None,
+            extra_indices=None,
+            extra_topk_lengths=None,
+        )
+        for kvcache in (old_kvcache, None):
+            with (
+                self.subTest(kvcache=kvcache),
+                patch.dict(
+                    sys.modules, {"lightop": old_package, "lightop.kvcache": kvcache}
+                ),
+                patch.object(
+                    torch.cuda, "is_current_stream_capturing", return_value=False
+                ),
             ):
-                result = obj._prepare_dsv4_bf16_flashmla_inputs(
-                    swa_k_cache=torch.zeros((1, 256, 1, 584), dtype=torch.uint8),
-                    swa_indices=indices,
-                    swa_topk_lengths=lengths,
-                    extra_k_cache=None,
-                    extra_indices=None,
-                    extra_topk_lengths=None,
-                )
-        gather.assert_called_once()
-        self.assertEqual(result[0].shape, (2, 8, 1, 512))
-        torch.testing.assert_close(result[2], lengths)
+                self.assertIsNone(obj._try_prepare_dsv4_w4a8_bf16_inputs(**args))
+                result = obj._prepare_dsv4_bf16_flashmla_inputs(**args)
+                gather.assert_called_once()
+                gather.reset_mock()
+                self.assertEqual(result[0].shape, (2, 8, 1, 512))
+                torch.testing.assert_close(result[2], lengths)
 
     def test_smaller_topk_keeps_reserved_graph_address_and_compact_stride(self):
         obj = workspace_methods()

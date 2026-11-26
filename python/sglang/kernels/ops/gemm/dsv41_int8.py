@@ -1147,16 +1147,19 @@ def _project_packed(
     raw = torch.empty((m, groups, rank), device=x.device, dtype=torch.int32)
     _load().gemm(q, packed, raw, plan)
     if quantize_output:
-        from lightop.quant import scale_per_token_quant_int8
-
-        return scale_per_token_quant_int8(
-            raw,
-            xs,
-            s,
-            output_dtype=dtype,
-            materialize_output=False,
-            threads=1024 if (groups, rank) == (8, 1024) else 512,
-        )
+        try:
+            from lightop.quant import scale_per_token_quant_int8
+        except ImportError:
+            pass  # WoB can quantize the materialized projection on older wheels.
+        else:
+            return scale_per_token_quant_int8(
+                raw,
+                xs,
+                s,
+                output_dtype=dtype,
+                materialize_output=False,
+                threads=1024 if (groups, rank) == (8, 1024) else 512,
+            )
     output = torch.empty((m, groups, rank), device=x.device, dtype=dtype)
     _scale_packed_output(raw, xs, s, output, role, batches, shard)
     return output

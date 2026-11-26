@@ -353,6 +353,15 @@ def _cp_interleave_has_long_cycle(rows, cp_size, min_cycle_rows):
     return not _cp_interleave_cycle_within(rows, cp_size, min_cycle_rows - 1)
 
 
+@lru_cache(maxsize=1)
+def _lightop_cp_output_reorder():
+    try:
+        from lightop.attention.cp_output import interleave_cp_output_
+    except ImportError:
+        return None
+    return interleave_cp_output_
+
+
 def _cp_output_reorder_method(tensor, rows, cp_size):
     from sglang.srt.environ import envs
 
@@ -371,11 +380,11 @@ def _cp_output_reorder_method(tensor, rows, cp_size):
             rows, cp_size, 512 if row_width == 5120 else 256
         )
     ):
-        return "tiled" if row_width == 5120 else None
+        return _interleave_cp_output_tiled_ if row_width == 5120 else None
     limit = envs.SGLANG_DSV4_CP_OUTPUT_INPLACE_MAX_CYCLE.get()
     if limit > 0 and not _cp_interleave_cycle_within(rows, cp_size, limit):
         return None
-    return "lightop"
+    return _lightop_cp_output_reorder()
 
 
 def _interleave_cp_output_tiled_(output_tensor, cp_size):
@@ -402,12 +411,8 @@ def _interleave_cp_output(output_tensor, cp_size):
     uses this helper. Bounded-replay gather_index retains its compact selection.
     """
     method = _cp_output_reorder_method(output_tensor, output_tensor.shape[0], cp_size)
-    if method == "tiled":
-        return _interleave_cp_output_tiled_(output_tensor, cp_size)
-    if method == "lightop":
-        from lightop.attention.cp_output import interleave_cp_output_
-
-        return interleave_cp_output_(output_tensor, cp_size)
+    if method is not None:
+        return method(output_tensor, cp_size)
     out_shape = output_tensor.shape
     return (
         output_tensor.view(cp_size, -1, *out_shape[1:])

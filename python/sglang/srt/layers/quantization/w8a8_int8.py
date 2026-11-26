@@ -40,6 +40,9 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.compressed_tensors import (
+    quant_ops as compressed_quant_ops,
+)
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
@@ -57,11 +60,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
     from sglang.srt.models.utils import WeightsMapper
 
-from lightop import gemm_ops as quant_ops
-
-from sglang.srt.layers.quantization.compressed_tensors import (
-    quant_ops as compressed_quant_ops,
-)
+try:
+    from lightop.gemm_ops import triton_scaled_mm
+except ImportError:
+    from sglang.kernels.ops.gemm.fp8_kernel import triton_scaled_mm
 
 _is_cuda = is_cuda()
 _is_hcu = is_hcu()
@@ -69,8 +71,12 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
 
+_hcu_per_token_quant_int8 = None
 if _is_hcu:
-    from lightop.quant import per_token_quant_int8
+    try:
+        from lightop.quant import per_token_quant_int8 as _hcu_per_token_quant_int8
+    except ImportError:
+        pass  # Keep the in-tree per-token quantizer.
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm  # noqa: F401 -- registers the custom op
@@ -283,7 +289,10 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             x_q, x_scale, output_dtype = x.unpack()
         elif input_quant_args is None:
             output_dtype = x.dtype
-            x_q, x_scale = per_token_quant_int8(x)
+            if _hcu_per_token_quant_int8 is None:
+                x_q, x_scale = per_token_quant_int8(x.contiguous())
+            else:
+                x_q, x_scale = _hcu_per_token_quant_int8(x)
         else:
             output_dtype = x.dtype
             if (
@@ -339,7 +348,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 output = output + bias
         else:
             output_shape = [*x_q.shape[:-1], layer.weight.shape[1]]
-            output = quant_ops.triton_scaled_mm(
+            output = triton_scaled_mm(
                 x_q_2d,
                 layer.weight,
                 x_scale_2d,
@@ -681,7 +690,10 @@ def transform_quant_available(groups, rank, width):
 
 def rope_grouped_input(x, frequencies, positions, groups, rank, rope_dim):
     """Emit the packed WoA operand; model initialization checks kernel support."""
-    from lightop.quant import rope_per_token_quant
+    try:
+        from lightop.quant import rope_per_token_quant
+    except ImportError:
+        return None
 
     from sglang.kernels.ops.gemm.dsv41_int8 import grouped_input_pitch
 

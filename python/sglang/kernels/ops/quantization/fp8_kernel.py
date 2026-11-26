@@ -46,7 +46,10 @@ _is_xpu = is_xpu()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _is_hcu:
-    from lightop.quant import per_token_quant_fp8 as lightop_per_token_quant_fp8
+    try:
+        from lightop.quant import per_token_quant_fp8 as lightop_per_token_quant_fp8
+    except ImportError:
+        lightop_per_token_quant_fp8 = None
 
 if _is_cuda:
     from sglang.kernels.ops.quantization import sgl_per_token_quant_fp8
@@ -70,6 +73,7 @@ if _is_musa:
     # per_token_group_quant is CUDA-only JIT; MUSA keeps the AOT v2 group-quant op.
     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
 
+_hip_per_token_quant_fp8 = None
 if _is_hip:
     try:
         from sgl_kernel import sgl_per_token_quant_fp8 as _hip_per_token_quant_fp8
@@ -1422,6 +1426,10 @@ elif _is_hcu:
                 )
                 if not input.is_contiguous():
                     input = input.contiguous()
+                if lightop_per_token_quant_fp8 is None:
+                    return sglang_per_token_quant_fp8(
+                        input, dtype=output.dtype, output_q=output, output_s=scale
+                    )
                 output, scale = lightop_per_token_quant_fp8(
                     input,
                     dtype=output.dtype,

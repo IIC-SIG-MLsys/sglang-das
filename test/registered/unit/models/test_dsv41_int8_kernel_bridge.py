@@ -59,6 +59,44 @@ class TestInt8KernelBridge(CustomTestCase):
                 )
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    def test_packed_wo_a_materializes_output_without_lightop_scale_quant(self):
+        groups, rank, width = 8, 1024, 4096
+        x = torch.zeros(1, groups, width, dtype=torch.bfloat16)
+        w = torch.empty(groups * rank, width, dtype=torch.int8)
+        ws = torch.arange(rank).repeat(groups).float().view(-1, 1)
+        xs = torch.arange(1, groups + 1).float().view(1, groups, 1)
+
+        def gemm(q, packed, raw, plan):
+            raw.fill_(3)
+
+        def scale(raw, xs, ws, output, *args):
+            output.copy_(raw * xs * ws.view(groups, rank))
+
+        with (
+            patch.dict(sys.modules, {"lightop.quant": types.ModuleType("quant")}),
+            dsv41_int8.envs.SGLANG_DSV41_INT8_SERVICE_OPT.override(True),
+            patch.object(
+                dsv41_int8,
+                "_packed_projection_plan",
+                return_value=(w, 1, width, groups, False),
+            ),
+            patch.object(
+                dsv41_int8, "_load", return_value=types.SimpleNamespace(gemm=gemm)
+            ),
+            patch.object(dsv41_int8, "_scale_packed_output", side_effect=scale),
+        ):
+            actual = dsv41_int8.project(
+                x,
+                w,
+                ws,
+                groups,
+                rank,
+                input_quant_args=(x.to(torch.int8), xs),
+                quantize_output=True,
+            )
+        expected = (3 * xs * ws.view(groups, rank)).to(x.dtype)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_invalid_projection_is_rejected_before_loading_native_ops(self):
         x = torch.zeros(2, 1, 4, dtype=torch.bfloat16)
         w = torch.ones(4, 4, dtype=torch.int8)

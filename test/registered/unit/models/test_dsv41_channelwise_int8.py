@@ -75,14 +75,14 @@ class TestChannelwiseInt8(unittest.TestCase):
             self.assertIs(vp.call_args.kwargs["weight_scale"], layer.weight_scale)
             self.assertIs(draft.draft_lm_head_vp, vp.return_value)
 
-    def make_layer(self):
-        layer = torch.nn.Linear(8, 4, bias=False)
+    def make_layer(self, out_features=4):
+        layer = torch.nn.Linear(8, out_features, bias=False)
         runtime.install(layer)
         return layer
 
     def load(self, layer):
-        w = torch.arange(32).reshape(4, 8).to(torch.int8)
-        s = torch.arange(1, 5).float().reshape(4, 1)
+        w = torch.arange(layer.weight.numel()).reshape(layer.weight.shape).to(torch.int8)
+        s = torch.arange(1, layer.weight.shape[0] + 1).float().unsqueeze(1)
         layer.weight.weight_loader(layer.weight, w)
         layer.weight_scale.weight_loader(layer.weight_scale, s)
         return w, s
@@ -267,9 +267,7 @@ class TestChannelwiseInt8(unittest.TestCase):
         self.load(head.markov_w2)
         head._tp_shard = SimpleNamespace(org_vocab_start=1, org_vocab_end=3)
         head._opt_markov_w2_bf16 = False
-        head.vocab_size = 2
         head.get_prev_embeddings = lambda ids: torch.ones(len(ids), 8)
-        head._vocab_gather = lambda x: x
 
         def project(x, w, scale, *, output_dtype=None):
             torch.testing.assert_close(scale, head.markov_w2.weight_scale[1:3])
@@ -277,8 +275,8 @@ class TestChannelwiseInt8(unittest.TestCase):
             return torch.ones(x.shape[0], w.shape[0], dtype=output_dtype)
 
         with patch.object(runtime, "linear", side_effect=project):
-            y = head._apply_step_logits_sharded(
-                base_local=torch.zeros(2, 2), token_ids=torch.zeros(2, dtype=torch.long)
+            y, _ = head.step_bias(
+                torch.zeros(2, dtype=torch.long), hidden_states=None, state=None
             )
         torch.testing.assert_close(y, torch.ones(2, 2))
 
@@ -291,47 +289,42 @@ class TestChannelwiseInt8(unittest.TestCase):
 
     def test_markov_greedy_keeps_int8_scale_slice(self):
         from sglang.srt.models.deepseek_v4_dspark import DSparkV4MarkovHead
+        from sglang.srt.speculative.dspark_components.dspark_draft import (
+            DraftNoise,
+            draft_markov_block,
+        )
 
         head = DSparkV4MarkovHead.__new__(DSparkV4MarkovHead)
         torch.nn.Module.__init__(head)
-        head.markov_w2 = self.make_layer()
+        head.markov_w2 = self.make_layer(out_features=8)
         self.load(head.markov_w2)
-        head._tp_shard = SimpleNamespace(org_vocab_start=1, org_vocab_end=3)
-        head._is_dsv41 = True
+        head._tp_shard = SimpleNamespace(org_vocab_start=4, org_vocab_end=6)
+        head.vocab_shard = SimpleNamespace(
+            start=4, gather=SimpleNamespace(gather_stacked=lambda partial: partial)
+        )
         head._opt_markov_w2_bf16 = True
-        head._shard_group = None
-        head._vocab_gather = SimpleNamespace(gather_stacked=None)
         head.get_prev_embeddings = lambda ids: torch.ones(
             len(ids), 8, dtype=torch.bfloat16
         )
 
-        class Base:
-            is_cuda = True
-            shape = (2, 3, 2)
-
-            def __getitem__(self, index):
-                return torch.zeros(2, 2)
-
-        calls = []
-
         def project(x, w, scale, *, output_dtype=None):
-            torch.testing.assert_close(scale, head.markov_w2.weight_scale[1:3])
+            torch.testing.assert_close(scale, head.markov_w2.weight_scale[4:6])
             self.assertEqual(output_dtype, torch.bfloat16)
-            calls.append(1)
             return torch.ones(2, 2, dtype=output_dtype)
 
-        with (
-            patch.object(runtime, "linear", side_effect=project),
-            patch(
-                "sglang.kernels.ops.speculative.dspark.sharded_greedy.sharded_greedy_step",
-                return_value=torch.ones(2, dtype=torch.long),
-            ),
-        ):
-            y = head.sample_block_greedy_fused(
-                Base(), first_prev_tokens=torch.zeros(2, dtype=torch.long)
+        with patch.object(runtime, "linear", side_effect=project) as projection:
+            tokens, _ = draft_markov_block(
+                markov_head=head,
+                base_logits=torch.zeros(2, 3, 2),
+                anchor_tokens=torch.zeros(2, dtype=torch.long),
+                draft_hidden=None,
+                step_temperatures=torch.ones(2),
+                noise=DraftNoise(key=0, offset=torch.zeros(1, dtype=torch.int64)),
+                tp_sync=SimpleNamespace(sync=lambda site, ids: ids),
+                greedy_draft=True,
             )
-        self.assertEqual(len(calls), 3)
-        self.assertEqual(y.shape, (2, 3))
+        self.assertEqual(projection.call_count, 3)
+        torch.testing.assert_close(tokens, torch.full((2, 3), 4, dtype=torch.long))
 
     def test_streaming_int8_immediate_and_bf16_unchanged(self):
         from sglang.srt.models.deepseek_v4 import _dequant_fp8_wo_a_streaming
