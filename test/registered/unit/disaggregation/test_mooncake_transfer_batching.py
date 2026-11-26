@@ -22,7 +22,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestMooncakeTransferBatching(unittest.TestCase):
+class TestMooncakeTransferBatching(CustomTestCase):
     @staticmethod
     def _make_manager(
         side_effect=None, enable_custom_mem_pool=False, max_batch_indices=0
@@ -86,6 +86,61 @@ class TestMooncakeTransferBatching(unittest.TestCase):
                 call("session", [1040, 2080], [5140, 6280], [10, 20]),
             ],
         )
+
+    def test_fragmented_plan_keeps_page_order_and_separate_destinations(self):
+        manager = self._make_manager(max_batch_indices=513)
+        src = np.arange(1600, dtype=np.int32) + 2**28
+        src[769:] += 200
+        host = np.arange(1600, dtype=np.int32) + 17
+        host[400:] += 33
+        device = np.arange(1600, dtype=np.int32) * 2 + 5
+        src_ptrs = [2**63 + 1000, 2**63 + 2000]
+        dst_ptrs = [2**63 + 5000, 2**63 + 6000]
+        item_lens = [512, 1024]
+        manager.get_mla_kv_ptrs_with_pp.return_value = (src_ptrs, dst_ptrs, 2)
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            ret = MooncakeKVManager._send_kvcache_generic(
+                manager,
+                mooncake_session_id="session",
+                src_data_ptrs=src_ptrs,
+                dst_data_ptrs=dst_ptrs,
+                item_lens=item_lens,
+                prefill_data_indices=src,
+                dst_data_indices=host,
+                dst_device_data_indices=device,
+                dst_device_data_ptrs={dst_ptrs[1]},
+                executor=executor,
+            )
+        self.assertEqual(ret, 0)
+        calls = manager.engine.batch_transfer_sync.call_args_list
+        self.assertEqual(len(calls), 4)
+        for batch, transfer in enumerate(calls):
+            start = batch * 513
+            end = start + 513
+            _, src_addrs, dst_addrs, lengths = transfer.args
+            num_device_runs = len(device[start:end])
+            # Every device page is its own run. Host runs end on a break on
+            # either side and may also be split by the transfer batch limit.
+            host_run_count = len(lengths) - num_device_runs
+            self.assertEqual(host_run_count, (2, 2, 1, 1)[batch])
+            for buffer, runs in enumerate(
+                (slice(None, host_run_count), slice(host_run_count, None))
+            ):
+                item_len = item_lens[buffer]
+                actual_pairs = [
+                    (
+                        (source - src_ptrs[buffer]) // item_len + offset,
+                        (dest - dst_ptrs[buffer]) // item_len + offset,
+                    )
+                    for source, dest, length in zip(
+                        src_addrs[runs], dst_addrs[runs], lengths[runs]
+                    )
+                    for offset in range(length // item_len)
+                ]
+                expected = host if buffer == 0 else device
+                self.assertEqual(
+                    actual_pairs, list(zip(src[start:end], expected[start:end]))
+                )
 
     def test_preserves_legacy_single_batch_path_for_short_transfers(self):
         for max_batch_indices in (0, 5, 6):

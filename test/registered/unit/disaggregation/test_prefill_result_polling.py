@@ -1492,6 +1492,24 @@ class TestPrefillPageIndexPrefetch(CustomTestCase):
                 self.assertEqual(req.disagg_page_indices["ready"].records, 1)
                 self.assertEqual(req.disagg_page_indices["ready"].synchronizations, 1)
 
+    def test_snapshot_translates_one_full_and_swa_index_per_page(self):
+        scheduler, req, _, pool = self._fixture()
+        allocator = scheduler.token_to_kv_pool_allocator
+
+        def translate_full(indices):
+            self.assertEqual(indices.tolist(), [40, 48])
+            return indices + 16
+
+        def translate_swa(indices):
+            self.assertEqual(indices.tolist(), [48])
+            return indices + 8
+
+        allocator.translate_kv_indices_for_transfer = translate_full
+        allocator.translate_swa_indices_for_transfer = translate_swa
+        self._prefetch(scheduler, req, pool)
+        self.assertEqual(self._pages(scheduler, req, 0, 4).tolist(), [28, 32])
+        self.assertEqual(self._pages(scheduler, req, 2, 4, swa=True).tolist(), [28])
+
     def test_mixed_full_and_swa_dtypes_are_prefetched(self):
         for full_dtype, swa_dtype in (
             (torch.int32, torch.int64),

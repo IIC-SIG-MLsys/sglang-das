@@ -6,7 +6,12 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 # (module, public_fn) migrated from mem_cache/triton_ops.
 _TRITON_KERNELS = [
@@ -29,6 +34,15 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="memory.alloc_extend_single_request",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.allocator:alloc_extend_single_request",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 
 __all__ = []
 

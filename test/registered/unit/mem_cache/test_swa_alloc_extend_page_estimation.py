@@ -7,10 +7,11 @@ last partial page. Fix replaces with get_num_new_pages-based gating.
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.mem_cache.allocator import paged
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -134,6 +135,61 @@ class TestSWAAllocExtendPageEstimation(CustomTestCase):
             extend_num_tokens=3,
         )
         self.assertIsNone(result)
+
+
+class TestPagedLongExtend(CustomTestCase):
+    def test_exact_capacity_and_refusal_with_partial_prefix(self):
+        # 250 reused tokens plus 64 new pages, including the partial final page.
+        page_size = 256
+        prefix_cpu = torch.tensor([6], dtype=torch.int64)
+        seq_cpu = torch.tensor([65 * page_size - 3], dtype=torch.int64)
+        extend = int(seq_cpu[0] - prefix_cpu[0])
+        last = torch.tensor([900 * page_size + 5])
+        device_prefix = MagicMock(is_cuda=True)
+        device_prefix.__len__.return_value = 1
+
+        allocator = paged.PagedTokenToKVPoolAllocator.__new__(
+            paged.PagedTokenToKVPoolAllocator
+        )
+        allocator.device = "cpu"
+        allocator.page_size = page_size
+        allocator.use_triton_kernels = True
+        allocator.sglang_kvalloc_kernel = True
+        allocator.lightop_kvalloc_kernel = False
+        allocator.debug_mode = False
+        allocator.staged_pages = []
+        pages = torch.arange(400, 528, 2, dtype=torch.int64)
+        starts = torch.arange(page_size, dtype=torch.int64)
+        tokens = (pages[:, None] * page_size + starts).flatten()[:-3]
+        expected = torch.cat((torch.arange(last[0] + 1, 901 * page_size), tokens))
+
+        def extend_on_device(prefix, last_loc, free_pages, out, ps):
+            self.assertEqual(ps, page_size)
+            # Mock the Triton boundary, reading the supplied free list in order.
+            new = (free_pages[:, None] * ps + starts).flatten()
+            out[:250].copy_(torch.arange(last_loc[0] + 1, 901 * ps))
+            out[250:].copy_(new[: out.numel() - 250])
+
+        with (
+            patch.object(paged, "_is_hcu", True),
+            paged.envs.SGLANG_HCU_PARALLEL_KV_ALLOC_EXTEND.override(True),
+            patch.object(
+                paged, "alloc_extend_single_request", side_effect=extend_on_device
+            ),
+        ):
+            allocator.free_pages = pages[:-1]
+            short = allocator.alloc_extend(
+                device_prefix, prefix_cpu, seq_cpu, seq_cpu, last, extend
+            )
+            self.assertIsNone(short)
+            torch.testing.assert_close(allocator.free_pages, pages[:-1])
+
+            allocator.free_pages = pages
+            indices = allocator.alloc_extend(
+                device_prefix, prefix_cpu, seq_cpu, seq_cpu, last, extend
+            )
+            torch.testing.assert_close(indices, expected)
+            self.assertEqual(allocator.free_pages.numel(), 0)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ import torch
 from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
+    alloc_extend_single_request,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
@@ -67,6 +68,19 @@ def _get_lightop_alloc_extend_kernel():
         _LIGHTOP_ALLOC_EXTEND_KERNEL = None
 
     return _LIGHTOP_ALLOC_EXTEND_KERNEL
+
+
+def use_parallel_alloc_extend(
+    prefix_lens: torch.Tensor, extend_num_tokens: int
+) -> bool:
+    # Short extends and multi-request batches already have a low-cost path.
+    return (
+        _is_hcu
+        and extend_num_tokens >= 16384
+        and prefix_lens.is_cuda
+        and len(prefix_lens) == 1
+        and envs.SGLANG_HCU_PARALLEL_KV_ALLOC_EXTEND.get()
+    )
 
 
 def alloc_extend_naive(
@@ -277,7 +291,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        if self.sglang_kvalloc_kernel:
+        if (
+            self.use_triton_kernels
+            and not (self.sglang_kvalloc_kernel and self.lightop_kvalloc_kernel)
+            and use_parallel_alloc_extend(prefix_lens, extend_num_tokens)
+        ):
+            alloc_extend_single_request(
+                prefix_lens, last_loc, self.free_pages, out_indices, self.page_size
+            )
+        elif self.sglang_kvalloc_kernel:
             alloc_extend_kernel_impl = (
                 _get_lightop_alloc_extend_kernel()
                 if self.lightop_kvalloc_kernel

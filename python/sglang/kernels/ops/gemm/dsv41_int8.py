@@ -16,7 +16,12 @@ from typing import NamedTuple
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
+
+from sglang.kernels.ops.quantization.dsv41_int8 import (
+    _quantize_int8_rows,
+    _supports_wo_a_inverse_rope,
+    quantize_wo_a_inverse_rope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -455,11 +460,7 @@ def _dsv41_int8_quantize_triton_kernel(
     offs = rows[:, None].to(tl.int64) * K + cols[None, :].to(tl.int64)
 
     x = tl.load(X_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-    max_abs = tl.max(tl.abs(x), axis=1)
-    absmax = tl.maximum(max_abs, 1.0e-10)
-    scale = tl.div_rn(absmax, 127.0)
-    inv_scale = tl.div_rn(127.0, absmax)
-    q = tl.clamp(libdevice.round(x * inv_scale[:, None]), -127.0, 127.0).to(tl.int8)
+    q, scale = _quantize_int8_rows(x, 1)
 
     tl.store(Q_ptr + offs, q, mask=mask)
     tl.store(S_ptr + rows, scale, mask=row_mask)
@@ -821,6 +822,7 @@ def _project_unpacked(
     tile_n=None,
     group_major=False,
     algo_rank=None,
+    input_quant_args=None,
 ):
     if (
         x.ndim != 3 or x.shape[1] != groups or groups <= 0 or rank <= 0
@@ -843,7 +845,7 @@ def _project_unpacked(
     if not t:
         return y
     ops = load_native()
-    q, xs = quantize(x)
+    q, xs = quantize(x) if input_quant_args is None else input_quant_args
     if group_major:
         q = q.transpose(0, 1).contiguous()
     raw = torch.empty((groups, t, rank) if group_major else (t, groups, rank),
@@ -923,12 +925,19 @@ def _pack(w,g,n,k,batches,lda,astride):
 
 
 def _prepare_packed_weight(w):
- if os.environ.get('SGLANG_DSV41_INT8_SERVICE_OPT')!='1' or not w.is_cuda:return
- if w.dtype!=torch.int8 or not w.is_contiguous() or w.ndim!=2:return
- n0,k=w.shape;g=8 if (n0,k)==(8192,4096) else 1;n=n0//g;role=_role(g,n,k)
- if role is None:return
- for m in ([1,256] if role in ('markov_tp8','markov_full') else [1]):
-  batches,lda,astride,_,_=_layout(role,m,g,n,k);_pack(w,g,n,k,batches,lda,astride)
+    if not _use_packed_service_projection() or not w.is_cuda:
+        return
+    if w.dtype != torch.int8 or not w.is_contiguous() or w.ndim != 2:
+        return
+    n0, k = w.shape
+    g = 8 if (n0, k) == (8192, 4096) else 1
+    n = n0 // g
+    role = _role(g, n, k)
+    if role is None:
+        return
+    for m in [1, 256] if role in ("markov_tp8", "markov_full") else [1]:
+        batches, lda, astride, _, _ = _layout(role, m, g, n, k)
+        _pack(w, g, n, k, batches, lda, astride)
 
 
 def release_weight_cache(weight):
@@ -981,15 +990,42 @@ def _project_packed(x,w,s,groups,rank,*,output_dtype=None,tile_n=None,group_majo
  return y
 
 
+def _use_packed_service_projection() -> bool:
+    return os.environ.get("SGLANG_DSV41_INT8_SERVICE_OPT") == "1"
+
+
 def prepare_weight(w):
-    if os.environ.get("SGLANG_DSV41_INT8_SERVICE_OPT") == "1":
+    if _use_packed_service_projection():
         _prepare_packed_weight(w)
 
 
 def project(x, w, s, groups, rank, **kwargs):
-    if os.environ.get("SGLANG_DSV41_INT8_SERVICE_OPT") == "1":
+    if _use_packed_service_projection():
         return _project_packed(x, w, s, groups, rank, **kwargs)
     return _project_unpacked(x, w, s, groups, rank, **kwargs)
+
+
+def try_project_wo_a_with_inverse_rope(x, w, s, groups, rank, freqs_cis, positions):
+    # Keep packed service GEMM, small/decode shapes, and graph capture on
+    # their existing paths. Large prefill already uses Triton for quantization.
+    if not (
+        x.is_cuda
+        and x.numel() >= _TRITON_QUANT_MIN_ELEMENTS
+        and _supports_wo_a_inverse_rope(x, freqs_cis, positions)
+        and _triton_quantize_enabled()
+        and _is_gfx936_device(x.device)
+        and not _use_packed_service_projection()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    return _project_unpacked(
+        x,
+        w,
+        s,
+        groups,
+        rank,
+        input_quant_args=quantize_wo_a_inverse_rope(x, freqs_cis, positions),
+    )
 
 
 @lru_cache(maxsize=4)

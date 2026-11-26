@@ -284,6 +284,34 @@ def attention_inv_rope(
     return torch.view_as_real(attn.freqs_cis).flatten(-2), positions
 
 
+def try_wo_a_int8_inv_rope(
+    attn, output: torch.Tensor, positions: torch.Tensor
+) -> Optional[torch.Tensor]:
+    if not (
+        envs.SGLANG_OPT_INT8_WO_A_FUSED_INVROPE.get()
+        and attn.head_dim == 512
+        and attn.qk_rope_head_dim == 64
+        and not is_in_breakable_cuda_graph()
+        and not is_batch_invariant_mode_enabled()
+        and not get_exec().deterministic.enable_deterministic_inference
+    ):
+        return None
+    from sglang.kernels.ops.gemm.dsv41_int8 import try_project_wo_a_with_inverse_rope
+    from sglang.srt.layers.quantization.w8a8_int8 import _projection_backend
+
+    _projection_backend()
+    groups = attn.n_local_groups
+    return try_project_wo_a_with_inverse_rope(
+        output.view(output.shape[0], groups, attn.wo_a.weight.shape[-1]),
+        attn.wo_a.weight,
+        attn.wo_a.weight_scale,
+        groups,
+        attn.o_lora_rank,
+        attn.freqs_cis,
+        positions,
+    )
+
+
 # ---- DeepseekV4DecoderLayer ----
 
 

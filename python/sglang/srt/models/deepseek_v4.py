@@ -103,7 +103,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
-from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
@@ -130,7 +130,6 @@ from sglang.srt.layers.utils.cp_utils import (
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.mm_utils import (
     pad_mm_tokens,
-    MultiModalityDataPaddingPatternMultimodalTokens,
     _embed_mm_inputs_with_split,
     release_consumed_pool_slots,
 )
@@ -3021,6 +3020,15 @@ class MQALayer(MqaAttentionBase):
                 self.wo_a.weight.view(G, self.o_lora_rank, -1),
                 self.wo_a.weight_scale_inv.data,
             )
+        elif (
+            _is_hcu
+            and self.wo_a_int8
+            and inv_rope is None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and (fused_wo_a := _hip.try_wo_a_int8_inv_rope(self, o, positions))
+            is not None
+        ):
+            o = fused_wo_a
         else:
             fuse_mxfp8_quant = (
                 self.use_flashinfer_mxfp8_wo_b and not get_forward().sp_active
