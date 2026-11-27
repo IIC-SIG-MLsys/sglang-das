@@ -2051,13 +2051,25 @@ class DeepseekV4AttnBackend(
                     )
                 else:
                     self._dsv4_bf16_dual_supported = False
-                    print_warning_once(
-                        "This flash_mla build lacks BF16 extra_kv support. "
-                        "Using LightOp BF16 FlashMLA for SWA-only layers and "
-                        "FP8 FlashMLA for dual-cache layers. Set "
-                        "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER=0 to use "
-                        "Triton combined gather for BF16 on all decode layers."
-                    )
+                    if _hcu_compact_gather_available():
+                        print_warning_once(
+                            "This flash_mla build lacks BF16 extra_kv support. "
+                            "Using LightOp BF16 FlashMLA for SWA-only and "
+                            "compact-gather layers, and FP8 FlashMLA for "
+                            "remaining dual-cache layers. Set "
+                            "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER=0 to use "
+                            "Triton combined gather for BF16 on all decode "
+                            "layers."
+                        )
+                    else:
+                        print_warning_once(
+                            "This flash_mla build lacks BF16 extra_kv support. "
+                            "Using LightOp BF16 FlashMLA for SWA-only layers "
+                            "and FP8 FlashMLA for dual-cache layers. Set "
+                            "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER=0 to use "
+                            "Triton combined gather for BF16 on all decode "
+                            "layers."
+                        )
             if self._dsv4_lightop_bf16_gather:
                 try:
                     from lightop import op as lightop_kvcache
@@ -4170,7 +4182,10 @@ class DeepseekV4AttnBackend(
         if (
             self._dsv4_compact_gather_enabled
             and self._dsv4_bf16_flashmla_decode
-            and getattr(self, "_dsv4_bf16_dual_supported", True)
+            and (
+                getattr(self, "_dsv4_bf16_dual_supported", True)
+                or (self._dsv4_lightop_bf16_gather and _hcu_compact_gather_available())
+            )
         ):
             self._allocate_dsv4_bf16_flashmla_workspace(
                 "combined",
@@ -7152,27 +7167,15 @@ class DeepseekV4AttnBackend(
         # KV input and attention path. IDLE must not allocate gather workspaces.
         # Compressed layers supply their extra pool even for zero extra tokens,
         # so this decision keeps the KV dtype stable for each ratio's sched_meta.
-        use_bf16_gather = (
-            self._dsv4_bf16_flashmla_decode
-            and (
-                extra_k_cache is None
-                or getattr(self, "_dsv4_bf16_dual_supported", True)
-            )
-            and (
-                logical_forward_mode.is_decode()
-                or logical_forward_mode.is_target_verify()
-                or logical_forward_mode.is_draft_extend_v2()
-            )
+        # Compact gather merges SWA + extra into one BF16 cache (extra_k_cache=None)
+        # and therefore works even when flash_mla lacks BF16 extra_kv support.
+        use_bf16_gather = self._dsv4_bf16_flashmla_decode and (
+            logical_forward_mode.is_decode()
+            or logical_forward_mode.is_target_verify()
+            or logical_forward_mode.is_draft_extend_v2()
         )
         if use_bf16_gather and swa_k_cache.dtype != torch.bfloat16:
-            (
-                swa_k_cache,
-                swa_page_indices,
-                swa_topk_lengths,
-                extra_k_cache,
-                extra_indices,
-                extra_topk_lengths,
-            ) = self._try_prepare_dsv4_w4a8_bf16_inputs(
+            prepared = self._try_prepare_dsv4_w4a8_bf16_inputs(
                 logical_forward_mode=logical_forward_mode,
                 swa_k_cache=swa_k_cache,
                 swa_indices=swa_page_indices,
@@ -7180,17 +7183,31 @@ class DeepseekV4AttnBackend(
                 extra_k_cache=extra_k_cache,
                 extra_indices=extra_indices,
                 extra_topk_lengths=extra_topk_lengths,
-            ) or self._prepare_dsv4_bf16_flashmla_inputs(
-                swa_k_cache=swa_k_cache,
-                swa_indices=swa_page_indices,
-                swa_topk_lengths=swa_topk_lengths,
-                extra_k_cache=extra_k_cache,
-                extra_indices=extra_indices,
-                extra_topk_lengths=extra_topk_lengths,
-                dedup=self._use_dsv4_bf16_gather_dedup(
-                    forward_batch, swa_page_indices.shape[0]
-                ),
             )
+            if prepared is None and (
+                extra_k_cache is None
+                or getattr(self, "_dsv4_bf16_dual_supported", True)
+            ):
+                prepared = self._prepare_dsv4_bf16_flashmla_inputs(
+                    swa_k_cache=swa_k_cache,
+                    swa_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    dedup=self._use_dsv4_bf16_gather_dedup(
+                        forward_batch, swa_page_indices.shape[0]
+                    ),
+                )
+            if prepared is not None:
+                (
+                    swa_k_cache,
+                    swa_page_indices,
+                    swa_topk_lengths,
+                    extra_k_cache,
+                    extra_indices,
+                    extra_topk_lengths,
+                ) = prepared
 
         input_dict = self._build_flash_mla_input_dict(
             q=q,

@@ -217,20 +217,20 @@ def flashmla_inputs(obj, ratio, *, mode="target_verify", extra_length=0):
 
 
 class TestBF16FlashMLACapability(CustomTestCase):
-    def test_old_flashmla_keeps_only_swa_on_lightop_bf16(self):
-        """A short compressed sequence still supplies an extra cache during capture."""
+    def test_old_flashmla_keeps_only_swa_on_lightop_bf16_without_compact_gather(self):
+        """Without compact gather, a short compressed sequence keeps dual layers on FP8."""
         both_explicit = {
             "SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA": "1",
             "SGLANG_DSV4_HCU_USE_LIGHTOP_BF16_GATHER": "1",
         }
-        for flags, compact in (({}, None), ({}, Mock()), (both_explicit, None)):
+        for flags in ({}, both_explicit):
             with (
-                self.subTest(flags=flags, compact=compact is not None),
+                self.subTest(flags=flags),
                 configured_workspace(
                     w4a8_config(),
                     supports_extra_kv=False,
                     flags=flags,
-                    compact_gather=compact,
+                    compact_gather=None,
                 ) as obj,
             ):
                 obj.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
@@ -253,6 +253,42 @@ class TestBF16FlashMLACapability(CustomTestCase):
                         flashmla_inputs(obj, 128, extra_length=3)["is_fp8_kvcache"]
                     )
                 self.assertEqual(set(obj._dsv4_bf16_flashmla_workspaces), {"swa"})
+
+    def test_old_flashmla_uses_compact_gather_when_available_and_fp8_for_unsupported_pages(
+        self,
+    ):
+        """Compact gather merges SWA + extra into one BF16 cache (extra_k_cache=None)."""
+        compact = Mock()
+        with configured_workspace(
+            w4a8_config(),
+            supports_extra_kv=False,
+            flags={},
+            compact_gather=compact,
+        ) as obj:
+            obj.init_cuda_graph_state(max_bs=1, max_num_tokens=1)
+            self.assertEqual(
+                set(obj._dsv4_bf16_flashmla_workspaces), {"swa", "combined"}
+            )
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=True
+            ):
+                swa = flashmla_inputs(obj, 0, mode="decode")
+                self.assertFalse(swa["is_fp8_kvcache"])
+                self.assertIsNone(swa["extra_k_cache"])
+                for ratio in (1, 2, 4):
+                    compact.reset_mock()
+                    merged = flashmla_inputs(obj, ratio, extra_length=3)
+                    compact.assert_called_once()
+                    self.assertFalse(merged["is_fp8_kvcache"])
+                    self.assertEqual(merged["k_cache"].dtype, torch.bfloat16)
+                    self.assertIsNone(merged["extra_k_cache"])
+                    self.assertEqual(merged["topk_length"].item(), 8 + 3)
+                # page_size=16 (C128) is not handled by compact gather -> stays on FP8.
+                compact.reset_mock()
+                c128 = flashmla_inputs(obj, 128, extra_length=3)
+                compact.assert_not_called()
+                self.assertTrue(c128["is_fp8_kvcache"])
+                self.assertEqual(c128["extra_k_cache"].dtype, torch.uint8)
 
     def test_explicit_bf16_uses_combined_triton_gather_on_old_flashmla(self):
         flags = {"SGLANG_DSV4_HCU_USE_BF16_FLASH_MLA": "1"}
